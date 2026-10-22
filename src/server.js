@@ -2,8 +2,16 @@ import { createApp } from './app.js';
 import { env } from './config/env.js';
 import { db } from './config/db.js';
 import { redis } from './config/redis.js';
+import { runMigrations } from './db/migrate.js';
 
 async function bootstrap() {
+  // Automatically ensure tables exist on startup (especially on new cloud hosts like Render)
+  try {
+    await runMigrations();
+  } catch (err) {
+    console.warn('⚠️  [ChatLeaf] Database migration check warning:', err.message);
+  }
+
   const app = await createApp();
   const server = app.listen(env.PORT, () => {
     console.log(`🍃 ChatLeaf Backend running on http://localhost:${env.PORT} in ${env.NODE_ENV} mode`);
