@@ -30,22 +30,6 @@ export const verifySignupSchema = z.object({
   }),
 });
 
-export const loginSchema = z.object({
-  body: z.object({
-    identifier: z.string().trim().min(1, 'User ID or email is required'),
-    password: z.string().min(1, 'Password is required'),
-    device: z.object({
-      deviceId: z.string().optional(),
-      deviceName: z.string().optional(),
-      model: z.string().optional(),
-      platform: z.string().optional(),
-      appVersion: z.string().optional(),
-    }).optional().default({}),
-    fcmToken: z.string().optional(),
-    ipAddress: z.string().optional(),
-    ip: z.string().optional(),
-  }),
-});
 
 export const refreshSchema = z.object({
   body: z.object({

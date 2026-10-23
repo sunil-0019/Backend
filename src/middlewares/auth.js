@@ -20,9 +20,7 @@ export async function requireAuth(req, res, next) {
     // Check Redis revocation
     const revokedReason = await redis.get(`revoked:sid:${payload.sessionId}`).catch(() => null);
     if (revokedReason) {
-      const message = revokedReason === 'PASSWORD_CHANGED'
-        ? 'Your password was changed. Please sign in with your new password.'
-        : 'Your session has been revoked. Please sign in again.';
+      const message = 'Your session has been revoked. Please sign in again.';
       return next(AppError.sessionRevoked(revokedReason, message));
     }
 
@@ -50,7 +48,7 @@ export async function requireAuth(req, res, next) {
 
     // Check token version
     if (typeof payload.tokenVersion === 'number' && row.token_version !== payload.tokenVersion) {
-      return next(AppError.sessionRevoked('PASSWORD_CHANGED', 'Your password was changed. Please sign in with your new password.'));
+      return next(AppError.sessionRevoked('SESSION_REVOKED', 'Your session has expired. Please sign in again.'));
     }
 
     // Throttled update of last_active_at (e.g. fire-and-forget)

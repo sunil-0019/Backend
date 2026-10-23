@@ -32,18 +32,7 @@ export const authController = {
     }
   },
 
-  async login(req, res, next) {
-    try {
-      const ip = req.body.ipAddress || req.body.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
-      const result = await authService.login({
-        ...req.body,
-        ip,
-      });
-      res.status(200).json(result);
-    } catch (err) {
-      next(err);
-    }
-  },
+
 
   async refresh(req, res, next) {
     try {

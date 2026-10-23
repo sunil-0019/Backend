@@ -54,8 +54,6 @@ async function inspect() {
       if (k.startsWith('otp:active:')) desc = 'Active 10-Min OTP Code (Redis)';
       if (k.startsWith('otp:limit:')) desc = 'OTP 24-Hour Rate Limiter & Lockout (Redis)';
       if (k.startsWith('revoked:sid:')) desc = 'Kicked/Revoked Session Blacklist (Redis)';
-      if (k.startsWith('forgot:link:')) desc = '10-Min Password Reset Magic Link (Redis)';
-      if (k.startsWith('forgot:count:')) desc = 'Forgot Password 24h Rate Limiter (Redis)';
       keyData.push({ Key: k, 'TTL (Seconds)': ttl, Purpose: desc });
     }
     console.table(keyData);

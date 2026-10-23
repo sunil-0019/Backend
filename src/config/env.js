@@ -14,7 +14,7 @@ const envSchema = z.object({
   MAIL_FROM_NAME: z.string().default('ChatLeaf'),
   BREVO_API_KEY: z.string().default('mock-key'),
   OTP_HMAC_SECRET: z.string().min(16, 'OTP_HMAC_SECRET must be at least 16 chars'),
-  PASSWORD_PEPPER: z.string().min(16, 'PASSWORD_PEPPER must be at least 16 chars'),
+  PASSWORD_PEPPER: z.string().optional(),
   JWT_PRIVATE_KEY: z.string().min(1, 'JWT_PRIVATE_KEY is required'),
   JWT_PUBLIC_KEY: z.string().min(1, 'JWT_PUBLIC_KEY is required'),
 });

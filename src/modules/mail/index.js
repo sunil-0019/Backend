@@ -18,14 +18,6 @@ export function register({ bus }) {
     }
   });
 
-  bus.on('user.passwordChanged', async (data) => {
-    try {
-      await mailService.send('password-updated', { email: data.email, name: data.name }, data);
-    } catch (err) {
-      console.error('Failed to send password-updated email:', err);
-    }
-  });
-
   bus.on('user.idChanged', async (data) => {
     try {
       await mailService.send('userid-updated', { email: data.email, name: data.name }, data);

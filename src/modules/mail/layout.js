@@ -56,7 +56,7 @@ export const layout = ({ preheader, title, body }) => `<!DOCTYPE html PUBLIC "-/
           <!-- Footer -->
           <tr>
             <td style="background-color: #f7fbf9; padding: 20px 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; line-height: 1.6; color: #62796f; text-align: center; border-top: 1px solid #eaf3ee;">
-              ChatLeaf will never ask for your password or OTP by chat, call, or email.<br />
+              ChatLeaf will never ask for your OTP by chat, call, or email.<br />
               Need help? <a href="mailto:${env.SUPPORT_EMAIL}" style="color: #0fa958; text-decoration: none; font-weight: 600;">${env.SUPPORT_EMAIL}</a> · © ChatLeaf
             </td>
           </tr>

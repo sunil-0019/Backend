@@ -2,7 +2,6 @@ import { db } from '../../config/db.js';
 import { redis } from '../../config/redis.js';
 import { bus } from '../../core/bus.js';
 import { AppError } from '../../core/errors.js';
-import { verifyPassword } from '../../utils/crypto.js';
 import { isIdAcceptable, generateUserId } from '../auth/userId.generator.js';
 
 export class UsersService {
@@ -58,7 +57,7 @@ export class UsersService {
     return db.withTransaction(async (client) => {
       // 1. Fetch user data with lock
       const userResult = await client.query(
-        `SELECT id, user_id, email, name, password_hash, user_id_change_count, user_id_changed_at
+        `SELECT id, user_id, email, name, user_id_change_count, user_id_changed_at
          FROM users
          WHERE id = $1
          FOR UPDATE`,

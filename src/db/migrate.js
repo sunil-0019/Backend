@@ -15,8 +15,6 @@ export async function runMigrations() {
       name                text   NOT NULL CHECK (char_length(name) BETWEEN 1 AND 50),
       about               text   NOT NULL DEFAULT 'Hey there, using ChatLeaf' CHECK (char_length(about) <= 139),
       photo_key           text   NULL,
-      password_hash       text   NOT NULL,
-      password_changed_at timestamptz NOT NULL DEFAULT now(),
       status              text   NOT NULL DEFAULT 'ACTIVE',
       token_version       int    NOT NULL DEFAULT 0,
       user_id_changed_at  timestamptz NULL,
@@ -29,6 +27,10 @@ export async function runMigrations() {
       CONSTRAINT user_id_format CHECK (char_length(user_id::text) BETWEEN 8 AND 100 AND user_id::text ~ '^[a-z][a-z0-9_]*$')
     );
     CREATE INDEX IF NOT EXISTS users_user_id_trgm ON users USING gin ((user_id::text) gin_trgm_ops);
+
+    -- Remove legacy password columns for 100% passwordless architecture
+    ALTER TABLE users DROP COLUMN IF EXISTS password_hash CASCADE;
+    ALTER TABLE users DROP COLUMN IF EXISTS password_changed_at CASCADE;
 
     CREATE OR REPLACE FUNCTION forbid_email_update() RETURNS trigger AS $$ BEGIN
       IF NEW.email IS DISTINCT FROM OLD.email THEN RAISE EXCEPTION 'EMAIL_IMMUTABLE'; END IF; RETURN NEW; END $$ LANGUAGE plpgsql;

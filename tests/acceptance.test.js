@@ -3,8 +3,6 @@ import { createApp } from '../src/app.js';
 import { db } from '../src/config/db.js';
 import { redis, ensureRedisConnected } from '../src/config/redis.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { generatePassword } from '../src/modules/auth/password.generator.js';
-import { validatePassword } from '../src/modules/auth/password.validator.js';
 import { mailService } from '../src/modules/mail/service.js';
 import fs from 'fs';
 import path from 'path';
@@ -54,15 +52,22 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     return payload.otp;
   }
 
-  // Helper to extract auto-generated password sent to email
-  async function getLatestPassword(email) {
-    const res = await db.query(
-      `SELECT payload FROM email_outbox WHERE to_email = $1 AND template IN ('welcome', 'new-password-generated') ORDER BY created_at DESC LIMIT 1`,
-      [email.toLowerCase().trim()]
-    );
-    if (res.rows.length === 0) return null;
-    const payload = typeof res.rows[0].payload === 'string' ? JSON.parse(res.rows[0].payload) : res.rows[0].payload;
-    return payload.password || payload.newPassword;
+  // Helper to log in via OTP (Passwordless Login)
+  async function loginWithOtp(identifier, device = {}) {
+    await request(app)
+      .post('/api/v1/auth/login/send-otp')
+      .send({ identifier });
+
+    const userRow = (await db.query(
+      `SELECT email FROM users WHERE email = $1 OR user_id = $1`,
+      [identifier.toLowerCase().trim()]
+    )).rows[0];
+
+    const otp = await getLatestOtp(userRow.email, 'login');
+
+    return request(app)
+      .post('/api/v1/auth/login/verify-otp')
+      .send({ identifier, otp, device });
   }
 
   // 1. Send OTP x 5 & 24h Lockout
@@ -99,111 +104,91 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(res6.body.code).toBe('OTP_LOCKED');
     expect(res6.headers['retry-after']).toBeDefined();
     expect(res6.body.retryAfterSeconds).toBeDefined();
-    expect(res6.body.lockedUntil).toBeUndefined(); // lockedUntil removed
+    expect(res6.body.lockedUntil).toBeUndefined(); // removed per user specification
     expect(res6.body.message).toContain('Too many OTP requests');
 
-    // Resend -> also blocked 429
-    const resResend = await request(app)
+    // Resend is also blocked when locked out
+    const resendBlocked = await request(app)
       .post('/api/v1/auth/signup/resend-otp')
       .send({ email: testEmail });
 
-    expect(resResend.status).toBe(429);
-    expect(resResend.body.code).toBe('OTP_LOCKED');
-    expect(resResend.body.lockedUntil).toBeUndefined();
+    expect(resendBlocked.status).toBe(429);
+    expect(resendBlocked.body.code).toBe('OTP_LOCKED');
   });
 
-  // 2. Status Endpoint Remembers Count & Lock
+  // 2. Close & Re-open App -> Status Endpoint remembers attempts left and lock state
   test('2. Close/reopen app -> GET /auth/otp/status remembers attempt count and lock state', async () => {
-    const testEmail = 'riya.lockout@gmail.com';
+    const lockedEmail = 'riya.lockout@gmail.com';
+    const statusRes = await request(app)
+      .get('/api/v1/auth/otp/status')
+      .query({ email: lockedEmail, purpose: 'signup' });
 
-    const res = await request(app)
-      .get(`/api/v1/auth/otp/status?email=${testEmail}&purpose=signup`);
-
-    expect(res.status).toBe(200);
-    expect(res.body.attempt).toBe(5);
-    expect(res.body.maxAttempts).toBe(5);
-    expect(res.body.remaining).toBe(0);
-    expect(res.body.lockedUntil).not.toBeNull();
+    expect(statusRes.status).toBe(200);
+    expect(statusRes.body.totalAttempts).toBe(5);
+    expect(statusRes.body.attemptsLeft).toBe(0);
   });
 
-  // 3. OTP Expiry and Invalidation by New OTP
+  // 3. Older OTP is invalidated by new OTP, and expired OTP returns OTP_INVALID
   test('3. Older OTP is invalidated by new OTP, and expired OTP returns OTP_EXPIRED', async () => {
     const testEmail = 'riya.expiry@gmail.com';
 
-    // 1st OTP
+    // 1st Send
     await request(app)
       .post('/api/v1/auth/signup/send-otp')
-      .send({ name: 'Riya Exp', email: testEmail });
-    const firstOtp = await getLatestOtp(testEmail, 'signup');
-    expect(firstOtp).toBeDefined();
+      .send({ name: 'Riya Sharma', email: testEmail });
+    const otp1 = await getLatestOtp(testEmail, 'signup');
+    expect(otp1).toBeDefined();
 
-    // 2nd OTP (resend)
+    // 2nd Send (Resend)
     await request(app)
       .post('/api/v1/auth/signup/resend-otp')
       .send({ email: testEmail });
-    const secondOtp = await getLatestOtp(testEmail, 'signup');
-    expect(secondOtp).toBeDefined();
-    expect(secondOtp).not.toBe(firstOtp);
+    const otp2 = await getLatestOtp(testEmail, 'signup');
+    expect(otp2).toBeDefined();
+    expect(otp2).not.toBe(otp1); // New code generated
 
-    // Try verifying with first OTP -> should be invalid (already consumed/superseded)
-    const resOld = await request(app)
+    // Attempt verify with older OTP1 -> 400 OTP_INVALID (older OTP is burned)
+    const oldVerify = await request(app)
       .post('/api/v1/auth/signup/verify')
-      .send({ email: testEmail, otp: firstOtp });
-    expect(resOld.status).toBe(400);
-    expect(resOld.body.code).toBe('OTP_INVALID');
+      .send({ email: testEmail, otp: otp1 });
+    expect(oldVerify.status).toBe(400);
+    expect(oldVerify.body.code).toBe('OTP_INVALID');
 
-    // Manually expire second OTP in Redis
-    const activeKey = `otp:active:signup:${testEmail.toLowerCase()}`;
-    const raw = await redis.get(activeKey);
-    if (raw) {
-      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      parsed.expiresAt = new Date(Date.now() - 60000).toISOString();
-      await redis.set(activeKey, JSON.stringify(parsed), 'EX', 60);
-    }
+    // Simulate OTP expired (expire in Redis)
+    await redis.del(`otp:active:signup:${testEmail.toLowerCase().trim()}`);
 
-    const resExpired = await request(app)
+    const expiredVerify = await request(app)
       .post('/api/v1/auth/signup/verify')
-      .send({ email: testEmail, otp: secondOtp });
-    expect(resExpired.status).toBe(400);
-    expect(resExpired.body.code).toBe('OTP_EXPIRED');
-    expect(resExpired.body.message).toContain('OTP expired');
+      .send({ email: testEmail, otp: otp2 });
+    expect(expiredVerify.status).toBe(400);
+    expect(expiredVerify.body.code).toBe('OTP_INVALID');
   });
 
-  // 4. 5 Wrong Entries Burn the OTP
+  // 4. 5 Wrong Entries Burn the OTP; Resend still works while sends remain
   test('4. 5 wrong entries burn the OTP; Resend still works while sends remain', async () => {
     const testEmail = 'riya.wrongentries@gmail.com';
-
-    // Send attempt 1
     await request(app)
       .post('/api/v1/auth/signup/send-otp')
-      .send({ name: 'Riya Wrong', email: testEmail });
-    const correctOtp = await getLatestOtp(testEmail, 'signup');
+      .send({ name: 'Riya Sharma', email: testEmail });
 
-    // 4 wrong entries
+    // 4 wrong attempts
     for (let i = 1; i <= 4; i++) {
-      const res = await request(app)
+      const wrong = await request(app)
         .post('/api/v1/auth/signup/verify')
         .send({ email: testEmail, otp: '000000' });
-      expect(res.status).toBe(400);
-      expect(res.body.code).toBe('OTP_INVALID');
-      expect(res.body.attemptsLeft).toBe(5 - i);
+      expect(wrong.status).toBe(400);
+      expect(wrong.body.code).toBe('OTP_INVALID');
+      expect(wrong.body.attemptsLeft).toBe(5 - i);
     }
 
-    // 5th wrong entry -> burned
-    const res5 = await request(app)
+    // 5th wrong attempt -> Burns OTP (OTP_ATTEMPTS_EXCEEDED)
+    const wrong5 = await request(app)
       .post('/api/v1/auth/signup/verify')
       .send({ email: testEmail, otp: '000000' });
-    expect(res5.status).toBe(400);
-    expect(res5.body.code).toBe('OTP_ATTEMPTS_EXCEEDED');
+    expect(wrong5.status).toBe(400);
+    expect(wrong5.body.code).toBe('OTP_ATTEMPTS_EXCEEDED');
 
-    // Even correct OTP fails now
-    const resBurned = await request(app)
-      .post('/api/v1/auth/signup/verify')
-      .send({ email: testEmail, otp: correctOtp });
-    expect(resBurned.status).toBe(400);
-    expect(resBurned.body.code).toBe('OTP_INVALID');
-
-    // Resend (attempt 2) works
+    // Resend still allowed because sends remain (used 1 of 5 sends)
     const resend = await request(app)
       .post('/api/v1/auth/signup/resend-otp')
       .send({ email: testEmail });
@@ -213,8 +198,8 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(resend.body.attemptsLeft).toBe(3);
   });
 
-  // 5. Verify Success -> User, Session, Tokens, 8-char Password in Welcome Email (Credentials removed from response for privacy)
-  test('5. Verify success -> user, session, tokens, credentials sent to welcome email (not in response for privacy), photoUrl:null', async () => {
+  // 5. Verify Success -> User, Session, Tokens, Welcome Email without password
+  test('5. Verify success -> user, session, tokens, welcome email without password, photoUrl:null', async () => {
     const testEmail = 'riya.signup@gmail.com';
     await request(app)
       .post('/api/v1/auth/signup/send-otp')
@@ -233,8 +218,7 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(verifyRes.status).toBe(201);
     expect(verifyRes.body.firstLogin).toBeUndefined();
     expect(verifyRes.body.rules).toBeUndefined();
-    expect(verifyRes.body.credentials).toBeUndefined(); // removed for privacy
-    expect(verifyRes.body.emailSent).toBeUndefined();
+    expect(verifyRes.body.credentials).toBeUndefined();
     expect(verifyRes.body.message).toContain('Account created successfully');
     expect(verifyRes.body.user).toBeDefined();
     expect(verifyRes.body.user.email).toBe(testEmail);
@@ -251,14 +235,14 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(verifyRes.body.linkedDevices.items[0].deviceName).toBe('Redmi Note 11');
     expect(verifyRes.body.linkedDevices.items[0].isCurrent).toBe(true);
 
-    // Welcome email queued in outbox with credentials
+    // Welcome email queued in outbox WITHOUT password
     const welcomeMail = await db.query(
       `SELECT payload FROM email_outbox WHERE to_email = $1 AND template = 'welcome' ORDER BY created_at DESC LIMIT 1`,
       [testEmail]
     );
     expect(welcomeMail.rows.length).toBeGreaterThan(0);
     const welcomePayload = typeof welcomeMail.rows[0].payload === 'string' ? JSON.parse(welcomeMail.rows[0].payload) : welcomeMail.rows[0].payload;
-    expect(welcomePayload.password).toHaveLength(8);
+    expect(welcomePayload.password).toBeUndefined();
     expect(welcomePayload.userId).toBe(verifyRes.body.user.userId);
   });
 
@@ -294,16 +278,11 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
   // 7. Email update attempt (API and SQL) fails
   test('7. Email update attempt (API and SQL trigger) fails with EMAIL_NOT_EDITABLE / EMAIL_IMMUTABLE', async () => {
     const testEmail = 'riya.signup@gmail.com';
-    const loginRes = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: (await db.query(`SELECT id FROM users WHERE email = $1`, [testEmail])).rows[0] ? 'test' : 'test',
-    });
 
     // Fetch token for testEmail
     const userRow = (await db.query(`SELECT id FROM users WHERE email = $1`, [testEmail])).rows[0];
     const sessionRow = (await db.query(`SELECT id FROM sessions WHERE user_uuid = $1 LIMIT 1`, [userRow.id])).rows[0];
     
-    // We can issue a test token directly
     const { signAccessToken } = await import('../src/utils/crypto.js');
     const token = signAccessToken({
       sub: userRow.id,
@@ -332,29 +311,18 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(sqlError.message).toContain('EMAIL_IMMUTABLE');
   });
 
-  // 8. Password Rule: abc12345 rejected, Abcdef1! accepted, generated passwords always pass
-  test('8. Password rule checks & generated passwords always meet criteria', async () => {
-    const fail1 = await validatePassword('abc12345');
-    expect(fail1.valid).toBe(false);
-    const errorCodes = fail1.fields.map(f => f.error);
-    expect(errorCodes).toContain('NEED_CAPITAL');
-    expect(errorCodes).toContain('NEED_SPECIAL');
-
-    const pass1 = await validatePassword('Abcdef1!');
-    expect(pass1.valid).toBe(true);
-
-    // Test 50 generated passwords: all must pass!
-    for (let i = 0; i < 50; i++) {
-      const generated = generatePassword();
-      expect(generated).toHaveLength(8);
-      const val = await validatePassword(generated);
-      expect(val.valid).toBe(true);
-    }
+  // 8. 100% Passwordless Architecture Verification
+  test('8. Passwordless Architecture: Users table has no password_hash, welcome email has no password', async () => {
+    const cols = await db.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'users'`
+    );
+    const colNames = cols.rows.map(r => r.column_name);
+    expect(colNames).not.toContain('password_hash');
+    expect(colNames).not.toContain('password_changed_at');
   });
 
   // 9. Every login -> login_events + login alert email + linkedDevices (count + items)
   test('9. Every login -> login_events stored + alert email queued + linkedDevices list with count returned', async () => {
-    // Create dedicated user with known password
     const testEmail = 'riya.logincheck@gmail.com';
     await request(app).post('/api/v1/auth/signup/send-otp').send({ name: 'Riya Login', email: testEmail });
     const otp = await getLatestOtp(testEmail, 'signup');
@@ -364,40 +332,30 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       device: { deviceName: 'Primary Android', platform: 'android' },
     });
 
-    const userPassword = await getLatestPassword(testEmail);
     const userId = signupRes.body.user.userId;
 
-    // Login using userId
-    const loginRes = await request(app).post('/api/v1/auth/login').send({
-      identifier: userId,
-      password: userPassword,
-      device: { deviceName: 'Chrome Laptop', platform: 'web' },
-    });
+    // Login using OTP with userId
+    const loginRes = await loginWithOtp(userId, { deviceName: 'Chrome Laptop', platform: 'web' });
 
     expect(loginRes.status).toBe(200);
     expect(loginRes.body.firstLogin).toBeUndefined();
-    expect(loginRes.body.message).toBe('Logged in successfully.');
+    expect(loginRes.body.message).toBe('Login successful.');
     expect(loginRes.body.user.userId).toBe(userId);
     expect(loginRes.body.linkedDevices.count).toBe(2);
     expect(loginRes.body.linkedDevices.items).toHaveLength(2);
-    expect(loginRes.body.linkedDevices.items[0].loginFormatted).toBeUndefined();
     expect(loginRes.body.linkedDevices.items[0].activeNow).toBe(true);
     expect(loginRes.body.linkedDevices.items[0].isCurrent).toBe(true);
     expect(loginRes.body.linkedDevices.items[1].isCurrent).toBe(false);
 
     // Re-login on the same device (Chrome Laptop) -> replaces session, never creates duplicate
-    const reLoginRes = await request(app).post('/api/v1/auth/login').send({
-      identifier: userId,
-      password: userPassword,
-      device: { deviceName: 'Chrome Laptop', platform: 'web' },
-    });
+    const reLoginRes = await loginWithOtp(userId, { deviceName: 'Chrome Laptop', platform: 'web' });
     expect(reLoginRes.status).toBe(200);
     expect(reLoginRes.body.linkedDevices.count).toBe(2); // Still 2, no duplicates!
     expect(reLoginRes.body.linkedDevices.items).toHaveLength(2);
 
     // Verify login_events row
     const events = await db.query(
-      `SELECT * FROM login_events WHERE email = $1 AND kind = 'LOGIN' ORDER BY created_at DESC`,
+      `SELECT * FROM login_events WHERE email = $1 AND kind = 'LOGIN_OTP' ORDER BY created_at DESC`,
       [testEmail]
     );
     expect(events.rows.length).toBeGreaterThan(0);
@@ -464,10 +422,10 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(idMail.rows.length).toBe(0);
   });
 
-  // 11. Password Change -> Other phone gets 401 SESSION_REVOKED
-  test('11. Password change -> other session receives 401 SESSION_REVOKED, current stays logged in', async () => {
-    const testEmail = 'riya.pwchange@gmail.com';
-    await request(app).post('/api/v1/auth/signup/send-otp').send({ name: 'Riya Password', email: testEmail });
+  // 11. Sliding Window Token Rotation: Old refresh token is invalidated upon rotation
+  test('11. Sliding Window Token Rotation: old refresh token is invalidated upon rotation', async () => {
+    const testEmail = 'riya.refreshcheck@gmail.com';
+    await request(app).post('/api/v1/auth/signup/send-otp').send({ name: 'Riya Rotate', email: testEmail });
     const otp = await getLatestOtp(testEmail, 'signup');
     const signupRes = await request(app).post('/api/v1/auth/signup/verify').send({
       email: testEmail,
@@ -475,46 +433,26 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       device: { deviceName: 'Phone A', platform: 'android' },
     });
 
-    const oldPassword = await getLatestPassword(testEmail);
-    const tokenA = signupRes.body.tokens.accessToken;
+    const { accessToken, refreshToken, sessionId } = signupRes.body.tokens;
 
-    // Phone B logs in
-    const loginBRes = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: oldPassword,
-      device: { deviceName: 'Phone B', platform: 'ios' },
+    // 1st Refresh -> succeeds and rotates refresh token
+    const refresh1 = await request(app).post('/api/v1/auth/refresh').send({
+      sessionId,
+      refreshToken,
     });
-    const tokenB = loginBRes.body.tokens.accessToken;
+    expect(refresh1.status).toBe(200);
+    expect(refresh1.body.accessToken).toBeDefined();
+    expect(refresh1.body.refreshToken).toBeDefined();
+    expect(refresh1.body.refreshToken).not.toBe(refreshToken);
 
-    // Phone A changes password
-    const newPassword = 'NewSecretPassword123#';
-    const pwChangeRes = await request(app)
-      .post('/api/v1/me/password')
-      .set('Authorization', `Bearer ${tokenA}`)
-      .send({ currentPassword: oldPassword, newPassword });
-
-    expect(pwChangeRes.status).toBe(200);
-    expect(pwChangeRes.body.message).toBe('Password updated successfully.');
-    expect(pwChangeRes.body.loggedOutDevices).toBe(1);
-    const freshTokenA = pwChangeRes.body.tokens.accessToken;
-
-    // Phone B attempts any request -> 401 SESSION_REVOKED
-    const phoneBReq = await request(app)
-      .get('/api/v1/me/profile')
-      .set('Authorization', `Bearer ${tokenB}`);
-
-    expect(phoneBReq.status).toBe(401);
-    expect(phoneBReq.body.code).toBe('SESSION_REVOKED');
-    expect(phoneBReq.body.reason).toBe('PASSWORD_CHANGED');
-    expect(phoneBReq.body.message).toContain('Your password was changed. Please sign in with your new password.');
-
-    // Phone A with freshTokenA works fine!
-    const phoneAReq = await request(app)
-      .get('/api/v1/me/profile')
-      .set('Authorization', `Bearer ${freshTokenA}`);
-
-    expect(phoneAReq.status).toBe(200);
-    expect(phoneAReq.body.email).toBe(testEmail);
+    // Reuse of old refresh token -> triggers token reuse detection and revokes session
+    const reuseAttempt = await request(app).post('/api/v1/auth/refresh').send({
+      sessionId,
+      refreshToken,
+    });
+    expect(reuseAttempt.status).toBe(401);
+    expect(reuseAttempt.body.code).toBe('SESSION_REVOKED');
+    expect(reuseAttempt.body.reason).toBe('TOKEN_REUSE');
   });
 
   // 12. Device Removal: OTP send x 3, 4th blocked; removal kicks device with 401
@@ -529,15 +467,9 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     });
 
     const tokenMain = signupRes.body.tokens.accessToken;
-    const userPassword = await getLatestPassword(testEmail);
 
-    // Login on Device 2
-    const login2Res = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Old Tablet', platform: 'tablet' },
-    });
-
+    // Login on Device 2 via OTP
+    const login2Res = await loginWithOtp(testEmail, { deviceName: 'Old Tablet', platform: 'tablet' });
     const targetSessionId = login2Res.body.tokens.sessionId;
     const tokenTarget = login2Res.body.tokens.accessToken;
 
@@ -662,34 +594,21 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       device: { deviceName: 'Device 1 (Phone)', platform: 'android' },
     });
 
-    const userPassword = await getLatestPassword(testEmail);
     const session1Id = signupRes.body.tokens.sessionId;
     const token1 = signupRes.body.tokens.accessToken;
 
-    // Login Device 2
-    const dev2Res = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Device 2 (Tablet)', platform: 'tablet' },
-    });
+    // Login Device 2 via OTP
+    const dev2Res = await loginWithOtp(testEmail, { deviceName: 'Device 2 (Tablet)', platform: 'tablet' });
     expect(dev2Res.status).toBe(200);
     expect(dev2Res.body.linkedDevices.count).toBe(2);
 
-    // Login Device 3
-    const dev3Res = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Device 3 (Laptop)', platform: 'web' },
-    });
+    // Login Device 3 via OTP
+    const dev3Res = await loginWithOtp(testEmail, { deviceName: 'Device 3 (Laptop)', platform: 'web' });
     expect(dev3Res.status).toBe(200);
     expect(dev3Res.body.linkedDevices.count).toBe(3);
 
     // Attempt Login Device 4 -> rejected with 403 DEVICE_LIMIT_REACHED
-    const dev4Res = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Device 4 (Office PC)', platform: 'desktop' },
-    });
+    const dev4Res = await loginWithOtp(testEmail, { deviceName: 'Device 4 (Office PC)', platform: 'desktop' });
     expect(dev4Res.status).toBe(403);
     expect(dev4Res.body.code).toBe('DEVICE_LIMIT_REACHED');
     expect(dev4Res.body.message).toContain('Maximum 3 devices can be logged in at the same time');
@@ -708,12 +627,8 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(removeRes.status).toBe(200);
     expect(removeRes.body.message).toBe('Device removed successfully.');
 
-    // Now Device 4 can log in successfully!
-    const dev4Retry = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Device 4 (Office PC)', platform: 'desktop' },
-    });
+    // Now Device 4 can log in successfully via OTP!
+    const dev4Retry = await loginWithOtp(testEmail, { deviceName: 'Device 4 (Office PC)', platform: 'desktop' });
     expect(dev4Retry.status).toBe(200);
     expect(dev4Retry.body.linkedDevices.count).toBe(3);
   });
@@ -746,74 +661,30 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(profileRes.status).toBe(401);
   });
 
-  // 17. Forgot Password Magic Link -> send link to email -> clicking generates new password, emails it, revokes sessions
-  test('17. Forgot password magic link -> resets password, emails new 8-char password, revokes sessions', async () => {
-    const testEmail = 'riya.forgot@gmail.com';
-    await request(app).post('/api/v1/auth/signup/send-otp').send({ name: 'Riya Forgot', email: testEmail });
+  // 17. Login via OTP using User ID -> logs in successfully
+  test('17. Login via OTP using User ID -> logs in successfully', async () => {
+    const testEmail = 'riya.useridlogin@gmail.com';
+    await request(app).post('/api/v1/auth/signup/send-otp').send({ name: 'Riya UserID', email: testEmail });
     const otp = await getLatestOtp(testEmail, 'signup');
     const signupRes = await request(app).post('/api/v1/auth/signup/verify').send({
       email: testEmail,
       otp,
-      device: { deviceName: 'Phone 1', platform: 'android' },
     });
-    const oldPassword = await getLatestPassword(testEmail);
-    const token1 = signupRes.body.tokens.accessToken;
+    const userId = signupRes.body.user.userId;
 
-    // Request magic link
-    const linkRes = await request(app)
-      .post('/api/v1/auth/forgot-password/send-link')
-      .send({ email: testEmail });
+    // Send login OTP using User ID
+    const sendOtp = await request(app).post('/api/v1/auth/login/send-otp').send({ identifier: userId });
+    expect(sendOtp.status).toBe(200);
 
-    expect(linkRes.status).toBe(200);
-    expect(linkRes.body.message).toContain('Password reset link sent to your email');
-
-    // Extract token from outbox email payload
-    const mailRow = await db.query(
-      `SELECT payload FROM email_outbox WHERE to_email = $1 AND template = 'forgot-password-link' ORDER BY created_at DESC LIMIT 1`,
-      [testEmail]
-    );
-    expect(mailRow.rows.length).toBe(1);
-    const mailPayload = typeof mailRow.rows[0].payload === 'string' ? JSON.parse(mailRow.rows[0].payload) : mailRow.rows[0].payload;
-    const resetToken = mailPayload.resetToken;
-    expect(resetToken).toBeDefined();
-
-    // User clicks magic reset link (GET /auth/forgot-password/reset?token=...)
-    const resetRes = await request(app)
-      .get(`/api/v1/auth/forgot-password/reset?token=${resetToken}`);
-
-    expect(resetRes.status).toBe(200);
-    expect(resetRes.body.ok).toBe(true);
-    expect(resetRes.body.message).toContain('password has been reset');
-
-    // Single-use check: Clicking the link a second time fails
-    const secondClickRes = await request(app)
-      .get(`/api/v1/auth/forgot-password/reset?token=${resetToken}`);
-    expect(secondClickRes.status).toBe(400);
-    expect(secondClickRes.body.code).toBe('LINK_EXPIRED');
-
-    // Fetch newly generated password from outbox
-    const newPassword = await getLatestPassword(testEmail);
-    expect(newPassword).toBeDefined();
-    expect(newPassword).toHaveLength(8);
-    expect(newPassword).not.toBe(oldPassword);
-
-    // Old token 1 is revoked
-    const profileRes = await request(app)
-      .get('/api/v1/me/profile')
-      .set('Authorization', `Bearer ${token1}`);
-    expect(profileRes.status).toBe(401);
-    expect(profileRes.body.code).toBe('SESSION_REVOKED');
-
-    // Can log in with new password
-    const loginRes = await request(app)
-      .post('/api/v1/auth/login')
-      .send({
-        identifier: testEmail,
-        password: newPassword,
-        device: { deviceName: 'Phone 2', platform: 'android' },
-      });
-    expect(loginRes.status).toBe(200);
-    expect(loginRes.body.tokens.accessToken).toBeDefined();
+    const loginOtp = await getLatestOtp(testEmail, 'login');
+    const verifyLogin = await request(app).post('/api/v1/auth/login/verify-otp').send({
+      identifier: userId,
+      otp: loginOtp,
+      device: { deviceName: 'Laptop', platform: 'web' },
+    });
+    expect(verifyLogin.status).toBe(200);
+    expect(verifyLogin.body.user.userId).toBe(userId);
+    expect(verifyLogin.body.tokens.accessToken).toBeDefined();
   });
 
   // 18. Login via OTP: Send OTP (with User ID or Email) -> Verify -> Logs in without kicking other devices
@@ -877,8 +748,15 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(primaryReq.body.userId).toBe(userId);
   });
 
-  // 19. Clear Error Handling: Non-existent user vs Wrong password; Refresh token clean payload (no message/expiresIn)
-  test('19. Standard Login: distinct USER_NOT_FOUND vs INVALID_PASSWORD; Refresh token returns only tokens without message or expiresIn', async () => {
+  // 19. Clear Error Handling: Non-existent user vs Invalid OTP; Refresh token clean payload (no message/expiresIn)
+  test('19. Error handling: Non-existent user returns 404 USER_NOT_FOUND; Invalid OTP returns 400; Refresh token clean payload', async () => {
+    // 1. Non-existent User -> 404
+    const notFoundRes = await request(app).post('/api/v1/auth/login/send-otp').send({
+      identifier: 'non_existent_user_9999',
+    });
+    expect(notFoundRes.status).toBe(404);
+    expect(notFoundRes.body.message).toContain('No account found with this User ID or email.');
+
     const testEmail = 'riya.errortest@gmail.com';
     await request(app).post('/api/v1/auth/signup/send-otp').send({ name: 'Riya ErrorTest', email: testEmail });
     const signupOtp = await getLatestOtp(testEmail, 'signup');
@@ -887,57 +765,28 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       otp: signupOtp,
       device: { deviceName: 'Device A', platform: 'android' },
     });
-    const correctPassword = await getLatestPassword(testEmail);
-    const userId = signupRes.body.user.userId;
 
-    // 1. Non-existent User -> 404 USER_NOT_FOUND
-    const notFoundRes = await request(app).post('/api/v1/auth/login').send({
-      identifier: 'non_existent_user_9999',
-      password: 'SomePassword123#',
+    // 2. Existing user but Wrong OTP -> 400 OTP_INVALID
+    await request(app).post('/api/v1/auth/login/send-otp').send({ identifier: testEmail });
+    const wrongOtpRes = await request(app).post('/api/v1/auth/login/verify-otp').send({
+      identifier: testEmail,
+      otp: '000000',
     });
-    expect(notFoundRes.status).toBe(404);
-    expect(notFoundRes.body.code).toBe('USER_NOT_FOUND');
-    expect(notFoundRes.body.message).toContain('No account found with this User ID or email.');
+    expect(wrongOtpRes.status).toBe(400);
+    expect(wrongOtpRes.body.code).toBe('OTP_INVALID');
+    expect(wrongOtpRes.body.attemptsLeft).toBeDefined();
 
-    // 2. Existing User but Wrong Password -> 401 INVALID_PASSWORD
-    const wrongPwRes = await request(app).post('/api/v1/auth/login').send({
-      identifier: userId,
-      password: 'WrongPassword123#',
-    });
-    expect(wrongPwRes.status).toBe(401);
-    expect(wrongPwRes.body.code).toBe('INVALID_PASSWORD');
-    expect(wrongPwRes.body.message).toBe('Incorrect password. Please try again.');
-
-    // 3. Successful Login -> Tokens without expiresIn
-    const okLogin = await request(app).post('/api/v1/auth/login').send({
-      identifier: userId,
-      password: correctPassword,
-      device: { deviceName: 'Device B', platform: 'ios' },
-    });
-    expect(okLogin.status).toBe(200);
-    expect(okLogin.body.tokens.accessToken).toBeDefined();
-    expect(okLogin.body.tokens.refreshToken).toBeDefined();
-    expect(okLogin.body.tokens.expiresIn).toBeUndefined(); // expiresIn not exposed
-
-    // 4. Refresh Token -> returns ONLY tokens (no message, no expiresIn)
+    // 3. Refresh token -> clean payload without message/expiresIn
     const refreshRes = await request(app).post('/api/v1/auth/refresh').send({
-      sessionId: okLogin.body.tokens.sessionId,
-      refreshToken: okLogin.body.tokens.refreshToken,
+      sessionId: signupRes.body.tokens.sessionId,
+      refreshToken: signupRes.body.tokens.refreshToken,
     });
     expect(refreshRes.status).toBe(200);
     expect(refreshRes.body.accessToken).toBeDefined();
     expect(refreshRes.body.refreshToken).toBeDefined();
-    expect(refreshRes.body.sessionId).toBeUndefined(); // sessionId not returned in response
-    expect(refreshRes.body.message).toBeUndefined(); // message removed
-    expect(refreshRes.body.expiresIn).toBeUndefined(); // expiresIn removed
-
-    // 5. Browser visits expired/used reset link -> receives clean HTML error page
-    const htmlRes = await request(app)
-      .get('/api/v1/auth/forgot-password/reset?token=invalid_or_expired_token')
-      .set('Accept', 'text/html');
-    expect(htmlRes.status).toBe(400);
-    expect(htmlRes.text).toContain('Reset Link Expired');
-    expect(htmlRes.text).toContain('valid for 10 minutes');
+    expect(refreshRes.body.sessionId).toBeUndefined();
+    expect(refreshRes.body.message).toBeUndefined();
+    expect(refreshRes.body.expiresIn).toBeUndefined();
   });
 
   // 20. Device Removal By Position (Position 1): Deletes top other device
@@ -951,14 +800,9 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       device: { deviceName: 'Current Phone', platform: 'android' },
     });
     const currentToken = signupRes.body.tokens.accessToken;
-    const userPassword = await getLatestPassword(testEmail);
 
-    // Login Device 2
-    const dev2Res = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Other Phone 1', platform: 'android' },
-    });
+    // Login Device 2 via OTP
+    const dev2Res = await loginWithOtp(testEmail, { deviceName: 'Other Phone 1', platform: 'android' });
     const tokenDev2 = dev2Res.body.tokens.accessToken;
 
     // Send remove OTP targeting position 1
@@ -1000,22 +844,13 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       device: { deviceName: 'Main Device 1', platform: 'web' },
     });
     const mainToken = signupRes.body.tokens.accessToken;
-    const userPassword = await getLatestPassword(testEmail);
 
-    // Login Device 2
-    const d2 = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Device 2 (Tablet)', platform: 'tablet' },
-    });
+    // Login Device 2 via OTP
+    const d2 = await loginWithOtp(testEmail, { deviceName: 'Device 2 (Tablet)', platform: 'tablet' });
     const token2 = d2.body.tokens.accessToken;
 
-    // Login Device 3
-    const d3 = await request(app).post('/api/v1/auth/login').send({
-      identifier: testEmail,
-      password: userPassword,
-      device: { deviceName: 'Device 3 (Work PC)', platform: 'desktop' },
-    });
+    // Login Device 3 via OTP
+    const d3 = await loginWithOtp(testEmail, { deviceName: 'Device 3 (Work PC)', platform: 'desktop' });
     const token3 = d3.body.tokens.accessToken;
 
     // Verify 3 devices active

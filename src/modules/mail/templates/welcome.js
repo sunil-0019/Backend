@@ -7,7 +7,7 @@ export default {
     preheader: 'Your ChatLeaf account credentials',
     title: `Welcome, ${c.name}! 🎉`,
     body: `
-      <p style="margin: 0 0 16px 0;">Your ChatLeaf account has been created. Here are your sign-in credentials:</p>
+      <p style="margin: 0 0 16px 0;">Your ChatLeaf account has been created successfully. Here are your account details:</p>
       
       <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f7fbf9; border: 1px solid #dfeed9; border-radius: 12px; overflow: hidden; margin-bottom: 24px;">
         <tr>
@@ -17,10 +17,6 @@ export default {
         <tr>
           <td width="36%" style="padding: 12px 14px; font-size: 13px; color: #52796f; font-weight: 600; white-space: nowrap; vertical-align: middle; border-bottom: 1px solid #e6f2eb;">🆔 User ID</td>
           <td width="64%" style="padding: 12px 14px; font-size: 14px; color: #0d2b22; font-weight: 700; font-family: monospace; letter-spacing: 0.5px; vertical-align: middle; border-bottom: 1px solid #e6f2eb;">${c.userId}</td>
-        </tr>
-        <tr>
-          <td width="36%" style="padding: 12px 14px; font-size: 13px; color: #52796f; font-weight: 600; white-space: nowrap; vertical-align: middle; border-bottom: 1px solid #e6f2eb;">🔑 Password</td>
-          <td width="64%" style="padding: 12px 14px; font-size: 15px; color: #0b7a3e; font-weight: 700; font-family: monospace; letter-spacing: 1px; vertical-align: middle; border-bottom: 1px solid #e6f2eb;">${c.password}</td>
         </tr>
         <tr>
           <td width="36%" style="padding: 12px 14px; font-size: 13px; color: #52796f; font-weight: 600; white-space: nowrap; vertical-align: middle;">✉ Email</td>
@@ -35,8 +31,7 @@ export default {
       <ul style="margin: 0 0 18px 0; padding-left: 20px; line-height: 1.6; font-size: 14px; color: #2d4a3e;">
         <li style="margin-bottom: 6px;">Account created: <b>${c.createdAtIST || new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST</b></li>
         <li style="margin-bottom: 6px;">Your sign-up OTP was valid for 10 minutes and is now used.</li>
-        <li style="margin-bottom: 6px;">User ID: can be changed up to <b>2 times in 3 months</b>.</li>
-        <li style="margin-bottom: 6px;">Password: change anytime in settings (min 8 chars, 1 capital, 1 special char).</li>
+        <li style="margin-bottom: 6px;">User ID: can be changed up to <b>2 times in 1 month (30 days)</b>.</li>
       </ul>
 
       <h3 style="margin: 20px 0 10px 0; font-size: 16px; color: #0d2b22;">🔒 Your Privacy</h3>
@@ -48,7 +43,7 @@ export default {
 
       <h3 style="margin: 20px 0 10px 0; font-size: 16px; color: #0d2b22;">🛡 Security Tips</h3>
       <ul style="margin: 0 0 20px 0; padding-left: 20px; line-height: 1.6; font-size: 14px; color: #2d4a3e;">
-        <li style="margin-bottom: 6px;">Save your credentials safely and change your password whenever desired.</li>
+        <li style="margin-bottom: 6px;">Sign in securely anytime using OTP sent to your registered email.</li>
         <li style="margin-bottom: 6px;">Every login sends an alert email to this address.</li>
         <li style="margin-bottom: 6px;">Removing any device requires an OTP sent to your email.</li>
       </ul>
@@ -57,5 +52,5 @@ export default {
         ChatLeaf – your personal space 🍃
       </div>`
   }),
-  text: (c) => `Welcome to ChatLeaf, ${c.name}!\nUser ID: ${c.userId}\nPassword: ${c.password}\nEmail: ${c.email} (immutable)\n\nPlease save your credentials safely.`
+  text: (c) => `Welcome to ChatLeaf, ${c.name}!\nUser ID: ${c.userId}\nEmail: ${c.email} (immutable)\n\nSign in anytime securely using your registered email or User ID with OTP.`
 };
