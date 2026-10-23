@@ -6,7 +6,7 @@ dotenv.config();
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().default(3000),
-  MONGO_URI: z.string().default(process.env.MONGO_URI || process.env.DATABASE_URL || 'mongodb+srv://sunilmisahara:Sunil127021@cluster.bzrjlb0.mongodb.net/whatsappClone?appName=Cluster'),
+  MONGO_URI: z.string().min(1, 'MONGO_URI is required (set it in .env or cloud environment variables)').default(process.env.MONGO_URI || process.env.DATABASE_URL || ''),
   DATABASE_URL: z.string().optional(),
   REDIS_URL: z.string().default('redis://127.0.0.1:6379'),
   APP_BASE_URL: z.string().default('http://localhost:3000'),
