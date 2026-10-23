@@ -28,16 +28,8 @@ export async function isIdAcceptable(id, client, options = {}) {
   return result;
 }
 
-let idGenQueue = Promise.resolve();
-
 export async function generateUserId(name, client, options = {}) {
-  // Serialize ID generation across concurrent calls
-  const release = await new Promise(resolve => {
-    idGenQueue = idGenQueue.then(() => resolve).catch(() => resolve);
-  });
-
-  try {
-    const cleanName = (name || 'user').trim();
+  const cleanName = (name || 'user').trim();
 
   // Create clean base with underscores: e.g. "Riya Sharma" -> "riya_sharma"
   let base = slugify(cleanName, { lower: true, strict: true, replacement: '_' })
@@ -79,7 +71,4 @@ export async function generateUserId(name, client, options = {}) {
   }
 
   throw new Error('USER_ID_GENERATION_FAILED');
-  } finally {
-    release();
-  }
 }

@@ -40,12 +40,11 @@ userSchema.virtual('displayName').get(function() {
 });
 
 // Email immutability enforcement
-userSchema.pre(['updateOne', 'findOneAndUpdate', 'updateMany'], function(next) {
+userSchema.pre(['updateOne', 'findOneAndUpdate', 'updateMany'], function() {
   const update = this.getUpdate();
   if (update && (update.email || (update.$set && update.$set.email))) {
-    return next(new Error('EMAIL_IMMUTABLE'));
+    throw new Error('EMAIL_IMMUTABLE');
   }
-  next();
 });
 
 export const User = mongoose.models.User || mongoose.model('User', userSchema, 'users');

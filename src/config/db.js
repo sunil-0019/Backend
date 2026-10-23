@@ -44,29 +44,10 @@ export const db = {
    * Run operations inside a MongoDB transaction (Atlas replica sets support multi-document transactions)
    */
   async withTransaction(callback) {
-    // If not connected, connect first
     if (mongoose.connection.readyState !== 1) {
       await connectDB();
     }
-
-    try {
-      const session = await mongoose.startSession();
-      try {
-        let result;
-        await session.withTransaction(async () => {
-          result = await callback(session);
-        });
-        return result;
-      } finally {
-        await session.endSession();
-      }
-    } catch (err) {
-      // If transactions are not supported on this deployment, run directly
-      if (err.message && (err.message.includes('Transaction numbers are only allowed') || err.message.includes('standalone'))) {
-        return callback(null);
-      }
-      throw err;
-    }
+    return callback(null);
   },
 
   ...models,
