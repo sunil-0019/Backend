@@ -29,7 +29,10 @@ export async function createApp() {
 
   app.get('/ready', async (req, res) => {
     try {
-      await db.query('SELECT 1');
+      if (db.mongoose.connection.readyState !== 1) {
+        await db.connect();
+      }
+      await db.mongoose.connection.db.admin().ping();
       await redis.ping();
       res.status(200).json({ status: 'READY', db: 'UP', redis: 'UP' });
     } catch (err) {

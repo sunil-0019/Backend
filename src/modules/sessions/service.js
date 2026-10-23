@@ -1,8 +1,10 @@
+import { v4 as uuidv4 } from 'uuid';
 import { db } from '../../config/db.js';
 import { redis } from '../../config/redis.js';
 import { bus } from '../../core/bus.js';
 import { AppError } from '../../core/errors.js';
 import { otpService } from '../otp/service.js';
+import { Session, LoginEvent } from '../../models/index.js';
 
 export class SessionsService {
   /**
@@ -10,33 +12,31 @@ export class SessionsService {
    */
   async listSessions(userUuid, currentSessionId) {
     // Auto-purge sessions inactive for more than 90 days (3 months)
-    await db.query(
-      `DELETE FROM sessions WHERE user_uuid = $1 AND (expires_at < now() OR last_active_at < now() - interval '90 days')`,
-      [userUuid]
-    );
+    await Session.deleteMany({
+      userUuid,
+      $or: [
+        { expiresAt: { $lt: new Date() } },
+        { lastActiveAt: { $lt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } },
+      ],
+    });
 
-    const res = await db.query(
-      `SELECT id, device_name, platform, ip, geo_city, geo_country,
-              created_at AS login_at, last_active_at
-       FROM sessions
-       WHERE user_uuid = $1
-       ORDER BY (id = $2) DESC, created_at DESC`,
-      [userUuid, currentSessionId]
-    );
+    const sessions = await Session.find({ userUuid }).sort({ createdAt: -1 });
 
     const now = Date.now();
-    const items = res.rows.map(row => {
+    const sorted = [...sessions].sort((a, b) => (b.id === currentSessionId ? 1 : 0) - (a.id === currentSessionId ? 1 : 0));
+
+    const items = sorted.map(row => {
       const isCurrent = row.id === currentSessionId;
-      const isRecent = row.last_active_at && (now - new Date(row.last_active_at).getTime() < 5 * 60 * 1000);
+      const isRecent = row.lastActiveAt && (now - new Date(row.lastActiveAt).getTime() < 5 * 60 * 1000);
       return {
         id: row.id,
-        deviceName: row.device_name || 'Unknown device',
+        deviceName: row.deviceName || 'Unknown device',
         platform: row.platform || 'web',
-        ip: row.ip ? row.ip.toString() : '127.0.0.1',
+        ip: row.ip || '127.0.0.1',
         activeNow: isCurrent || Boolean(isRecent),
         isCurrent,
-        loginAt: row.login_at,
-        lastActiveAt: row.last_active_at,
+        loginAt: row.createdAt,
+        lastActiveAt: row.lastActiveAt,
       };
     });
 
@@ -57,14 +57,11 @@ export class SessionsService {
     const str = String(identifier).trim().toLowerCase();
 
     if (str === 'all' || str === 'remove-all') {
-      const otherRes = await db.query(
-        `SELECT id, device_name FROM sessions WHERE user_uuid = $1 AND id <> $2`,
-        [userUuid, currentSessionId]
-      );
-      if (otherRes.rows.length === 0) {
+      const otherSessions = await Session.find({ userUuid, _id: { $ne: currentSessionId } });
+      if (otherSessions.length === 0) {
         throw AppError.badRequest('No other linked devices to remove.', 'NO_OTHER_DEVICES');
       }
-      return { type: 'ALL', count: otherRes.rows.length, sessions: otherRes.rows };
+      return { type: 'ALL', count: otherSessions.length, sessions: otherSessions };
     }
 
     const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
@@ -73,29 +70,21 @@ export class SessionsService {
       if (str === currentSessionId) {
         throw AppError.badRequest('Use /auth/logout to sign out from the current device.', 'USE_LOGOUT');
       }
-      const res = await db.query(
-        `SELECT id, device_name, geo_city, platform, ip FROM sessions WHERE id = $1 AND user_uuid = $2`,
-        [str, userUuid]
-      );
-      if (res.rows.length === 0) {
+      const session = await Session.findOne({ _id: str, userUuid });
+      if (!session) {
         throw AppError.notFound('Session not found or already removed.');
       }
-      return { type: 'SINGLE', session: res.rows[0] };
+      return { type: 'SINGLE', session };
     }
 
     // Check if integer position (1, 2, 3...)
     if (/^\d+$/.test(str)) {
       const pos = parseInt(str, 10);
-      const otherRes = await db.query(
-        `SELECT id, device_name, geo_city, platform, ip FROM sessions
-         WHERE user_uuid = $1 AND id <> $2
-         ORDER BY created_at DESC`,
-        [userUuid, currentSessionId]
-      );
-      if (pos < 1 || pos > otherRes.rows.length) {
+      const otherSessions = await Session.find({ userUuid, _id: { $ne: currentSessionId } }).sort({ createdAt: -1 });
+      if (pos < 1 || pos > otherSessions.length) {
         throw AppError.notFound(`No linked device found at position ${pos}.`);
       }
-      return { type: 'SINGLE', session: otherRes.rows[pos - 1] };
+      return { type: 'SINGLE', session: otherSessions[pos - 1] };
     }
 
     throw AppError.badRequest('Invalid session ID or position.');
@@ -135,8 +124,8 @@ export class SessionsService {
       email: userEmail,
       payload: {
         sessionId: session.id,
-        deviceName: session.device_name || 'Linked Device',
-        city: session.geo_city || '',
+        deviceName: session.deviceName || 'Linked Device',
+        city: session.geoCity || '',
       },
       template: 'otp-remove-device',
     });
@@ -144,7 +133,7 @@ export class SessionsService {
     return {
       ...result,
       sessionId: session.id,
-      deviceName: session.device_name,
+      deviceName: session.deviceName,
     };
   }
 
@@ -178,34 +167,26 @@ export class SessionsService {
         otp,
       });
 
-      return db.withTransaction(async (client) => {
-        const otherSessionsRes = await client.query(
-          `SELECT id, device_name FROM sessions WHERE user_uuid = $1 AND id <> $2`,
-          [userUuid, currentSessionId]
-        );
-        const otherSessions = otherSessionsRes.rows;
+      return db.withTransaction(async () => {
+        const otherSessions = await Session.find({ userUuid, _id: { $ne: currentSessionId } });
 
         for (const s of otherSessions) {
           await redis.set(`revoked:sid:${s.id}`, 'REMOVED_BY_USER', 'EX', 1200);
         }
 
-        await client.query(
-          `DELETE FROM sessions WHERE user_uuid = $1 AND id <> $2`,
-          [userUuid, currentSessionId]
-        );
+        await Session.deleteMany({ userUuid, _id: { $ne: currentSessionId } });
 
-        await client.query(
-          `INSERT INTO login_events (
-             user_uuid, email, session_id, kind, success, ip, device_name, platform
-           )
-           VALUES ($1, $2, $3, 'ALL_OTHER_DEVICES_REMOVED', true, $4::inet, 'All other devices', 'all')`,
-          [
-            userUuid,
-            userEmail,
-            currentSessionId,
-            reqMeta.ip && !reqMeta.ip.includes(':') ? reqMeta.ip : '127.0.0.1',
-          ]
-        );
+        await LoginEvent.create({
+          _id: uuidv4(),
+          userUuid,
+          email: userEmail,
+          sessionId: currentSessionId,
+          kind: 'ALL_OTHER_DEVICES_REMOVED',
+          success: true,
+          ip: reqMeta.ip && !reqMeta.ip.includes(':') ? reqMeta.ip : '127.0.0.1',
+          deviceName: 'All other devices',
+          platform: 'all',
+        });
 
         bus.emit('session.removed', {
           name: userName,
@@ -230,40 +211,31 @@ export class SessionsService {
       otp,
     });
 
-    return db.withTransaction(async (client) => {
-      const sessionRes = await client.query(
-        `SELECT id, device_name, platform, ip FROM sessions WHERE id = $1 AND user_uuid = $2`,
-        [targetSessionId, userUuid]
-      );
-
-      if (sessionRes.rows.length === 0) {
+    return db.withTransaction(async () => {
+      const session = await Session.findOne({ _id: targetSessionId, userUuid });
+      if (!session) {
         throw AppError.notFound('Session no longer exists.');
       }
 
-      const session = sessionRes.rows[0];
-
-      await client.query(`DELETE FROM sessions WHERE id = $1`, [targetSessionId]);
+      await Session.deleteOne({ _id: targetSessionId });
       await redis.set(`revoked:sid:${targetSessionId}`, 'REMOVED_BY_USER', 'EX', 1200);
 
-      await client.query(
-        `INSERT INTO login_events (
-           user_uuid, email, session_id, kind, success, ip, device_name, platform
-         )
-         VALUES ($1, $2, $3, 'DEVICE_REMOVED', true, $4::inet, $5, $6)`,
-        [
-          userUuid,
-          userEmail,
-          targetSessionId,
-          reqMeta.ip && !reqMeta.ip.includes(':') ? reqMeta.ip : '127.0.0.1',
-          session.device_name,
-          session.platform,
-        ]
-      );
+      await LoginEvent.create({
+        _id: uuidv4(),
+        userUuid,
+        email: userEmail,
+        sessionId: targetSessionId,
+        kind: 'DEVICE_REMOVED',
+        success: true,
+        ip: reqMeta.ip && !reqMeta.ip.includes(':') ? reqMeta.ip : '127.0.0.1',
+        deviceName: session.deviceName,
+        platform: session.platform,
+      });
 
       bus.emit('session.removed', {
         name: userName,
         email: userEmail,
-        deviceName: session.device_name,
+        deviceName: session.deviceName,
       });
 
       return {
@@ -278,25 +250,19 @@ export class SessionsService {
    * Get login history
    */
   async getLoginHistory(userUuid, { limit = 20, cursor = null } = {}) {
-    let query = `
-      SELECT id, kind, success, reason, ip, geo_city, geo_country, device_name, platform, created_at
-      FROM login_events
-      WHERE user_uuid = $1
-    `;
-    const params = [userUuid];
-
+    const filter = { userUuid };
     if (cursor) {
-      query += ` AND id < $2`;
-      params.push(cursor);
+      filter._id = { $lt: cursor };
     }
 
-    query += ` ORDER BY id DESC LIMIT $${params.length + 1}`;
-    params.push(Math.min(limit, 100));
+    const items = await LoginEvent.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(Math.min(limit, 100))
+      .lean();
 
-    const res = await db.query(query, params);
     return {
-      items: res.rows,
-      nextCursor: res.rows.length > 0 ? res.rows[res.rows.length - 1].id : null,
+      items,
+      nextCursor: items.length > 0 ? items[items.length - 1]._id : null,
     };
   }
 }

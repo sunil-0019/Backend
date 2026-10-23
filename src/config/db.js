@@ -1,46 +1,75 @@
-import pg from 'pg';
+import mongoose from 'mongoose';
 import { env } from './env.js';
+import * as models from '../models/index.js';
 
-const { Pool } = pg;
+let isConnected = false;
 
-const isLocal = env.DATABASE_URL.includes('localhost') || env.DATABASE_URL.includes('127.0.0.1');
+export async function connectDB() {
+  if (isConnected && mongoose.connection.readyState === 1) {
+    return mongoose.connection;
+  }
 
-export const pool = new Pool({
-  connectionString: env.DATABASE_URL,
-  ssl: isLocal ? false : { rejectUnauthorized: false },
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
-});
+  const uri = env.MONGO_URI || env.DATABASE_URL;
+  if (!uri) {
+    throw new Error('MONGO_URI is required to connect to MongoDB');
+  }
 
-pool.on('error', (err) => {
-  console.error('Unexpected error on idle PostgreSQL client', err);
-});
+  try {
+    await mongoose.connect(uri, {
+      maxPoolSize: 20,
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 45000,
+    });
+    isConnected = true;
+    console.log('🍃 [ChatLeaf] MongoDB connected successfully');
+    return mongoose.connection;
+  } catch (err) {
+    console.error('❌ [ChatLeaf] MongoDB connection error:', err.message);
+    throw err;
+  }
+}
 
 export const db = {
-  pool,
-  query: (text, params) => pool.query(text, params),
-  
-  /**
-   * Run operations inside a PostgreSQL transaction.
-   * Automatically executes BEGIN, COMMIT, and ROLLBACK.
-   */
-  async withTransaction(callback) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const result = await callback(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
+  mongoose,
+  connection: mongoose.connection,
+  connect: connectDB,
+  close: async () => {
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect();
+      isConnected = false;
     }
   },
 
-  async close() {
-    await pool.end();
-  }
+  /**
+   * Run operations inside a MongoDB transaction (Atlas replica sets support multi-document transactions)
+   */
+  async withTransaction(callback) {
+    // If not connected, connect first
+    if (mongoose.connection.readyState !== 1) {
+      await connectDB();
+    }
+
+    try {
+      const session = await mongoose.startSession();
+      try {
+        let result;
+        await session.withTransaction(async () => {
+          result = await callback(session);
+        });
+        return result;
+      } finally {
+        await session.endSession();
+      }
+    } catch (err) {
+      // If transactions are not supported on this deployment, run directly
+      if (err.message && (err.message.includes('Transaction numbers are only allowed') || err.message.includes('standalone'))) {
+        return callback(null);
+      }
+      throw err;
+    }
+  },
+
+  ...models,
 };
+
+export default db;

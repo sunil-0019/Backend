@@ -28,11 +28,16 @@ export async function isIdAcceptable(id, client, options = {}) {
   return result;
 }
 
-export async function generateUserId(name, client, options = {}) {
-  // Advisory transaction lock to serialize ID generation across concurrent signups
-  await client.query('SELECT pg_advisory_xact_lock(70001)');
+let idGenQueue = Promise.resolve();
 
-  const cleanName = (name || 'user').trim();
+export async function generateUserId(name, client, options = {}) {
+  // Serialize ID generation across concurrent calls
+  const release = await new Promise(resolve => {
+    idGenQueue = idGenQueue.then(() => resolve).catch(() => resolve);
+  });
+
+  try {
+    const cleanName = (name || 'user').trim();
 
   // Create clean base with underscores: e.g. "Riya Sharma" -> "riya_sharma"
   let base = slugify(cleanName, { lower: true, strict: true, replacement: '_' })
@@ -74,4 +79,7 @@ export async function generateUserId(name, client, options = {}) {
   }
 
   throw new Error('USER_ID_GENERATION_FAILED');
+  } finally {
+    release();
+  }
 }

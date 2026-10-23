@@ -1,3 +1,4 @@
+import { v4 as uuidv4 } from 'uuid';
 import { db } from '../../config/db.js';
 import { redis } from '../../config/redis.js';
 import { bus } from '../../core/bus.js';
@@ -10,6 +11,7 @@ import {
   generateRefreshToken,
   hashToken,
 } from '../../utils/crypto.js';
+import { User, Session, LoginEvent, UserIdHistory } from '../../models/index.js';
 
 export class AuthService {
   /**
@@ -19,12 +21,9 @@ export class AuthService {
     const normalizedEmail = email.trim().toLowerCase();
 
     // 1. Check if email already registered
-    const existing = await db.query(
-      `SELECT 1 FROM users WHERE email = $1 LIMIT 1`,
-      [normalizedEmail]
-    );
+    const existing = await User.findOne({ email: normalizedEmail }).lean();
 
-    if (existing.rows.length > 0) {
+    if (existing) {
       throw AppError.conflict('You already have a ChatLeaf account. Please sign in.', 'ACCOUNT_EXISTS');
     }
 
@@ -45,11 +44,8 @@ export class AuthService {
     const normalizedEmail = email.trim().toLowerCase();
 
     // Check if email already registered
-    const existing = await db.query(
-      `SELECT 1 FROM users WHERE email = $1 LIMIT 1`,
-      [normalizedEmail]
-    );
-    if (existing.rows.length > 0) {
+    const existing = await User.findOne({ email: normalizedEmail }).lean();
+    if (existing) {
       throw AppError.conflict('You already have a ChatLeaf account. Please sign in.', 'ACCOUNT_EXISTS');
     }
 
@@ -63,7 +59,7 @@ export class AuthService {
   }
 
   /**
-   * Verify Signup & Create Account
+   * Verify Signup & Create Account (100% passwordless / OTP authentication)
    */
   async verifySignup({ email, otp, device = {}, ip = '127.0.0.1' }) {
     const normalizedEmail = email.trim().toLowerCase();
@@ -77,93 +73,88 @@ export class AuthService {
 
     const name = (verified.payload && verified.payload.name) ? verified.payload.name : 'User';
 
-    return db.withTransaction(async (client) => {
-      // 2. Generate unique and acceptable User ID (with advisory lock)
-      const userId = await generateUserId(name, client);
+    return db.withTransaction(async () => {
+      // 2. Generate unique and acceptable User ID
+      const userId = await generateUserId(name);
 
-      // 3. Create user (100% passwordless / OTP authentication)
-      const userResult = await client.query(
-        `INSERT INTO users (
-           user_id, email, name, about, photo_key,
-           status, token_version, first_login_at, last_login_at
-         )
-         VALUES ($1, $2, $3, 'Hey there, using ChatLeaf', NULL, 'ACTIVE', 0, now(), now())
-         RETURNING id, user_id, email, name, about, photo_key, created_at, token_version`,
-        [userId, normalizedEmail, name]
-      );
-      const user = userResult.rows[0];
+      // 3. Create user
+      const user = await User.create({
+        _id: uuidv4(),
+        userId,
+        email: normalizedEmail,
+        name,
+        fullName: name,
+        about: 'Hey there, using ChatLeaf',
+        photoKey: null,
+        status: 'ACTIVE',
+        tokenVersion: 0,
+        firstLoginAt: new Date(),
+        lastLoginAt: new Date(),
+      });
 
       // 4. Generate Refresh & Access Tokens
       const rawRefreshToken = generateRefreshToken();
       const refreshHash = hashToken(rawRefreshToken);
 
-      const sessionResult = await client.query(
-        `INSERT INTO sessions (
-           user_uuid, device_id, device_name, model, platform, app_version,
-           ip, refresh_hash, created_at, last_active_at, expires_at
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, now(), now(), now() + interval '90 days')
-         RETURNING id, device_name, platform, created_at, last_active_at`,
-        [
-          user.id,
-          device.deviceId || null,
-          device.deviceName || 'Primary Device',
-          device.model || null,
-          device.platform || 'unknown',
-          device.appVersion || null,
-          ip.includes(':') ? '127.0.0.1' : ip, // fallback to standard ipv4 for inet if ipv6 localhost
-          refreshHash,
-        ]
-      );
-      const session = sessionResult.rows[0];
+      const session = await Session.create({
+        _id: uuidv4(),
+        userUuid: user.id,
+        deviceId: device.deviceId || null,
+        deviceName: device.deviceName || 'Primary Device',
+        model: device.model || null,
+        platform: device.platform || 'unknown',
+        appVersion: device.appVersion || null,
+        ip: ip.includes(':') ? '127.0.0.1' : ip,
+        refreshHash,
+        createdAt: new Date(),
+        lastActiveAt: new Date(),
+        expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000), // 90 days
+      });
 
       const accessToken = signAccessToken({
         sub: user.id,
-        userId: user.user_id,
+        userId: user.userId,
         sessionId: session.id,
-        tokenVersion: user.token_version,
+        tokenVersion: user.tokenVersion,
       });
 
       // 5. Record login event
-      await client.query(
-        `INSERT INTO login_events (
-           user_uuid, email, session_id, kind, success, ip, device_name, platform
-         )
-         VALUES ($1, $2, $3, 'SIGNUP', true, $4::inet, $5, $6)`,
-        [
-          user.id,
-          user.email,
-          session.id,
-          ip.includes(':') ? '127.0.0.1' : ip,
-          session.device_name,
-          session.platform,
-        ]
-      );
+      await LoginEvent.create({
+        _id: uuidv4(),
+        userUuid: user.id,
+        email: user.email,
+        sessionId: session.id,
+        kind: 'SIGNUP',
+        success: true,
+        ip: ip.includes(':') ? '127.0.0.1' : ip,
+        deviceName: session.deviceName,
+        platform: session.platform,
+      });
 
-      // Prepare welcome and security email contexts
-      const createdAtDate = new Date(user.created_at);
+      // Prepare welcome email payload
+      const createdAtDate = new Date(user.createdAt);
       const emailPayload = {
         name: user.name,
-        userId: user.user_id,
+        userId: user.userId,
         email: user.email,
         createdAtIST: createdAtDate.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         createdAtUTC: createdAtDate.toUTCString(),
       };
 
-      // Send welcome email (committed in same transaction)
-      await mailService.send('welcome', { email: user.email, name: user.name }, emailPayload, { client });
+      // Send welcome email
+      await mailService.send('welcome', { email: user.email, name: user.name }, emailPayload);
       bus.emit('session.created', { userId: user.id, sessionId: session.id });
 
       return {
         message: 'Account created successfully. Welcome to ChatLeaf!',
         user: {
           id: user.id,
-          userId: user.user_id,
+          userId: user.userId,
           name: user.name,
           email: user.email,
           about: user.about,
-          photoUrl: user.photo_key,
-          createdAt: user.created_at,
+          photoUrl: user.photoKey,
+          createdAt: user.createdAt,
         },
         tokens: {
           accessToken,
@@ -175,13 +166,13 @@ export class AuthService {
           items: [
             {
               id: session.id,
-              deviceName: session.device_name || 'Chrome · Windows',
+              deviceName: session.deviceName || 'Chrome · Windows',
               platform: session.platform || 'web',
-              ip: session.ip ? session.ip.toString() : (ip || '127.0.0.1'),
+              ip: session.ip || '127.0.0.1',
               activeNow: true,
               isCurrent: true,
-              loginAt: session.created_at,
-              lastActiveAt: session.last_active_at || session.created_at,
+              loginAt: session.createdAt,
+              lastActiveAt: session.lastActiveAt || session.createdAt,
             },
           ],
         },
@@ -189,60 +180,54 @@ export class AuthService {
     });
   }
 
-
   /**
-   * Refresh Token
+   * Refresh Token (Sliding window: old token invalid, new token valid for 90 days / 3 months)
    */
   async refresh({ refreshToken, sessionId }) {
-    const sessionResult = await db.query(
-      `SELECT s.*, u.id AS user_id, u.user_id AS user_handle, u.status, u.token_version
-       FROM sessions s
-       JOIN users u ON u.id = s.user_uuid
-       WHERE s.id = $1`,
-      [sessionId]
-    );
-
-    if (sessionResult.rows.length === 0) {
+    const session = await Session.findById(sessionId);
+    if (!session) {
       throw AppError.sessionRevoked('SESSION_REVOKED', 'Session expired or removed.');
     }
 
-    const session = sessionResult.rows[0];
+    const user = await User.findById(session.userUuid);
+    if (!user) {
+      throw AppError.sessionRevoked('SESSION_REVOKED', 'Session expired or removed.');
+    }
 
-    // Verify session validity (3 months / 90 days validity window)
-    if (session.expires_at && new Date(session.expires_at) < new Date()) {
-      await db.query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+    // Verify session validity
+    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
+      await Session.deleteOne({ _id: sessionId });
       throw AppError.sessionRevoked('SESSION_EXPIRED', 'Session expired. Please log in again.');
     }
 
-    if (session.status !== 'ACTIVE') {
+    if (user.status !== 'ACTIVE') {
       throw AppError.forbidden('Account is not active.');
     }
 
     const providedHash = hashToken(refreshToken);
 
     // Verify current refresh hash
-    if (!providedHash.equals(session.refresh_hash)) {
+    if (!providedHash.equals(session.refreshHash)) {
       // Possible reuse attack! Invalidate session immediately
-      await db.query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+      await Session.deleteOne({ _id: sessionId });
       throw AppError.sessionRevoked('TOKEN_REUSE', 'Invalid refresh token. Session revoked for security.');
     }
 
-    // Rotate refresh token (Sliding window: old token invalid, new token valid for 90 days / 3 months)
+    // Rotate refresh token
     const newRawRefreshToken = generateRefreshToken();
     const newRefreshHash = hashToken(newRawRefreshToken);
 
-    await db.query(
-      `UPDATE sessions
-       SET prev_refresh_hash = refresh_hash, refresh_hash = $1, last_active_at = now(), expires_at = now() + interval '90 days'
-       WHERE id = $2`,
-      [newRefreshHash, sessionId]
-    );
+    session.prevRefreshHash = session.refreshHash;
+    session.refreshHash = newRefreshHash;
+    session.lastActiveAt = new Date();
+    session.expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+    await session.save();
 
     const accessToken = signAccessToken({
-      sub: session.user_uuid,
-      userId: session.user_handle,
+      sub: user.id,
+      userId: user.userId,
       sessionId: session.id,
-      tokenVersion: session.token_version,
+      tokenVersion: user.tokenVersion,
     });
 
     return {
@@ -255,7 +240,7 @@ export class AuthService {
    * Logout current session
    */
   async logout(sessionId) {
-    await db.query(`DELETE FROM sessions WHERE id = $1`, [sessionId]);
+    await Session.deleteOne({ _id: sessionId });
     return { ok: true, message: 'Logged out successfully.' };
   }
 
@@ -267,16 +252,14 @@ export class AuthService {
     const isEmail = rawIdentifier.includes('@');
     const lookupParam = isEmail ? rawIdentifier.toLowerCase() : rawIdentifier;
 
-    const query = isEmail
-      ? `SELECT id, user_id, email, name, status, locked_until FROM users WHERE email = $1`
-      : `SELECT id, user_id, email, name, status, locked_until FROM users WHERE user_id = $1`;
+    const user = await User.findOne(
+      isEmail ? { email: lookupParam } : { userId: lookupParam }
+    ).lean();
 
-    const userResult = await db.query(query, [lookupParam]);
-    if (userResult.rows.length === 0) {
+    if (!user) {
       throw AppError.notFound('No account found with this User ID or email.');
     }
 
-    const user = userResult.rows[0];
     if (user.status !== 'ACTIVE') {
       throw AppError.forbidden('This account is not active.');
     }
@@ -287,9 +270,9 @@ export class AuthService {
       purpose: 'login',
       template: 'otp-login',
       payload: {
-        name: user.name,
-        userUuid: user.id,
-        userId: user.user_id,
+        name: user.name || user.fullName,
+        userUuid: user._id.toString(),
+        userId: user.userId,
       },
     });
 
@@ -304,16 +287,14 @@ export class AuthService {
     const isEmail = rawIdentifier.includes('@');
     const lookupParam = isEmail ? rawIdentifier.toLowerCase() : rawIdentifier;
 
-    const query = isEmail
-      ? `SELECT id, user_id, email, name, about, photo_key, status, locked_until, token_version FROM users WHERE email = $1`
-      : `SELECT id, user_id, email, name, about, photo_key, status, locked_until, token_version FROM users WHERE user_id = $1`;
+    const user = await User.findOne(
+      isEmail ? { email: lookupParam } : { userId: lookupParam }
+    );
 
-    const userResult = await db.query(query, [lookupParam]);
-    if (userResult.rows.length === 0) {
+    if (!user) {
       throw AppError.notFound('No account found with this User ID or email.');
     }
 
-    const user = userResult.rows[0];
     if (user.status !== 'ACTIVE') {
       throw AppError.forbidden('This account is not active.');
     }
@@ -330,35 +311,34 @@ export class AuthService {
     const deviceId = device.deviceId || null;
 
     // 2. Auto-purge sessions inactive for more than 90 days (3 months)
-    await db.query(
-      `DELETE FROM sessions WHERE user_uuid = $1 AND (expires_at < now() OR last_active_at < now() - interval '90 days')`,
-      [user.id]
-    );
+    await Session.deleteMany({
+      userUuid: user.id,
+      $or: [
+        { expiresAt: { $lt: new Date() } },
+        { lastActiveAt: { $lt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) } },
+      ],
+    });
 
     // 3. Check if an existing session already exists for this same physical device
-    const existingSameDevice = await db.query(
-      `SELECT id FROM sessions
-       WHERE user_uuid = $1
-         AND (
-           ($2::text IS NOT NULL AND device_id = $2)
-           OR (device_id IS NULL AND device_name = $3 AND platform = $4)
-         )`,
-      [user.id, deviceId, deviceName, platform]
-    );
+    const sameDeviceQuery = {
+      userUuid: user.id,
+      ...(deviceId
+        ? { deviceId }
+        : { deviceName, platform }),
+    };
+
+    const existingSameDevice = await Session.find(sameDeviceQuery);
 
     // If logging in on same device again, revoke old session so no duplicate sessions exist
-    if (existingSameDevice.rows.length > 0) {
-      for (const oldRow of existingSameDevice.rows) {
-        await db.query(`DELETE FROM sessions WHERE id = $1`, [oldRow.id]);
-        await redis.set(`revoked:sid:${oldRow.id}`, 'NEW_LOGIN_SAME_DEVICE', 'EX', 1200);
+    if (existingSameDevice.length > 0) {
+      for (const oldRow of existingSameDevice) {
+        await Session.deleteOne({ _id: oldRow._id });
+        await redis.set(`revoked:sid:${oldRow._id}`, 'NEW_LOGIN_SAME_DEVICE', 'EX', 1200);
       }
     } else {
       // Different device: check 3 active devices limit
-      const activeSessionsCount = await db.query(
-        `SELECT COUNT(*)::int AS count FROM sessions WHERE user_uuid = $1`,
-        [user.id]
-      );
-      if (activeSessionsCount.rows[0].count >= 3) {
+      const activeCount = await Session.countDocuments({ userUuid: user.id });
+      if (activeCount >= 3) {
         throw AppError.forbidden(
           'Maximum 3 devices can be logged in at the same time. Please remove an older device first.',
           'DEVICE_LIMIT_REACHED'
@@ -366,124 +346,109 @@ export class AuthService {
       }
     }
 
-    // 4. Create new session (does NOT kick other logged-in devices!)
+    // 4. Create new session
     const rawRefreshToken = generateRefreshToken();
     const refreshHash = hashToken(rawRefreshToken);
 
-    const sessionResult = await db.query(
-      `INSERT INTO sessions (
-         user_uuid, device_id, device_name, model, platform, app_version,
-         ip, refresh_hash, created_at, last_active_at, expires_at
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8, now(), now(), now() + interval '90 days')
-       RETURNING id, device_name, platform, ip, geo_city, geo_country, created_at, last_active_at`,
-      [
-        user.id,
-        deviceId,
-        deviceName,
-        device.model || null,
-        platform,
-        device.appVersion || null,
-        ip.includes(':') ? '127.0.0.1' : ip,
-        refreshHash,
-      ]
-    );
-    const session = sessionResult.rows[0];
+    const session = await Session.create({
+      _id: uuidv4(),
+      userUuid: user.id,
+      deviceId,
+      deviceName,
+      model: device.model || null,
+      platform,
+      appVersion: device.appVersion || null,
+      ip: ip.includes(':') ? '127.0.0.1' : ip,
+      refreshHash,
+      createdAt: new Date(),
+      lastActiveAt: new Date(),
+      expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000), // 90 days
+    });
 
     // 5. Generate Access Token
     const accessToken = signAccessToken({
       sub: user.id,
-      userId: user.user_id,
+      userId: user.userId,
       sessionId: session.id,
-      tokenVersion: user.token_version,
+      tokenVersion: user.tokenVersion,
     });
 
     // 6. Record login event
-    await db.query(
-      `INSERT INTO login_events (
-         user_uuid, email, session_id, kind, success, ip, device_name, platform
-       )
-       VALUES ($1, $2, $3, 'LOGIN_OTP', true, $4::inet, $5, $6)`,
-      [
-        user.id,
-        user.email,
-        session.id,
-        ip.includes(':') ? '127.0.0.1' : ip,
-        session.device_name,
-        session.platform,
-      ]
-    );
+    await LoginEvent.create({
+      _id: uuidv4(),
+      userUuid: user.id,
+      email: user.email,
+      sessionId: session.id,
+      kind: 'LOGIN_OTP',
+      success: true,
+      ip: ip.includes(':') ? '127.0.0.1' : ip,
+      deviceName: session.deviceName,
+      platform: session.platform,
+    });
 
     // 7. Emit login event (sends login alert email)
     bus.emit('user.loggedIn', {
       userUuid: user.id,
       email: user.email,
-      name: user.name,
+      name: user.name || user.fullName,
       sessionId: session.id,
-      deviceName: session.device_name,
+      deviceName: session.deviceName,
       platform: session.platform,
       ip: session.ip || ip,
-      city: session.geo_city,
-      country: session.geo_country,
-      loginAt: session.created_at,
+      city: session.geoCity || '',
+      country: session.geoCountry || '',
+      loginAt: session.createdAt,
     });
     bus.emit('auth.login', {
       userUuid: user.id,
       email: user.email,
-      name: user.name,
+      name: user.name || user.fullName,
       sessionId: session.id,
-      deviceName: session.device_name,
+      deviceName: session.deviceName,
       platform: session.platform,
       ip: session.ip || ip,
-      city: session.geo_city,
-      country: session.geo_country,
-      loginAt: session.created_at,
+      city: session.geoCity || '',
+      country: session.geoCountry || '',
+      loginAt: session.createdAt,
     });
 
     // 8. Fetch linked devices
-    const devicesResult = await db.query(
-      `SELECT id, device_name, platform, ip, geo_city, geo_country,
-              created_at AS login_at, last_active_at
-       FROM sessions
-       WHERE user_uuid = $1
-       ORDER BY (id = $2) DESC, created_at DESC`,
-      [user.id, session.id]
-    );
+    const userSessions = await Session.find({ userUuid: user.id }).sort({ createdAt: -1 });
 
     const now = Date.now();
-    const items = devicesResult.rows.map(row => {
-      const isCurrent = row.id === session.id;
-      const isRecent = row.last_active_at && (now - new Date(row.last_active_at).getTime() < 5 * 60 * 1000);
-      return {
-        id: row.id,
-        deviceName: row.device_name || 'Unknown device',
-        platform: row.platform || 'web',
-        ip: row.ip ? row.ip.toString() : '127.0.0.1',
-        activeNow: isCurrent || Boolean(isRecent),
-        isCurrent,
-        loginAt: row.login_at,
-        lastActiveAt: row.last_active_at,
-      };
-    });
+    const items = userSessions
+      .sort((a, b) => (b.id === session.id ? 1 : 0) - (a.id === session.id ? 1 : 0))
+      .map(row => {
+        const isCurrent = row.id === session.id;
+        const isRecent = row.lastActiveAt && (now - new Date(row.lastActiveAt).getTime() < 5 * 60 * 1000);
+        return {
+          id: row.id,
+          deviceName: row.deviceName || 'Unknown device',
+          platform: row.platform || 'web',
+          ip: row.ip || '127.0.0.1',
+          activeNow: isCurrent || Boolean(isRecent),
+          isCurrent,
+          loginAt: row.createdAt,
+          lastActiveAt: row.lastActiveAt,
+        };
+      });
 
     // Check user_id edit availability (max 2 edits in 30 days)
-    const historyRes = await db.query(
-      `SELECT changed_at FROM user_id_history
-       WHERE user_uuid = $1 AND changed_at > now() - interval '30 days'
-       ORDER BY changed_at ASC`,
-      [user.id]
-    );
-    const userIdEditAvailable = historyRes.rows.length < 2;
+    const historyDocs = await UserIdHistory.find({
+      userUuid: user.id,
+      changedAt: { $gt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+    }).sort({ changedAt: 1 });
+    const userIdEditAvailable = historyDocs.length < 2;
 
     return {
       message: 'Login successful.',
       user: {
         id: user.id,
-        userId: user.user_id,
-        name: user.name,
+        userId: user.userId,
+        name: user.name || user.fullName,
         email: user.email,
         about: user.about,
-        photoUrl: user.photo_key,
+        photoUrl: user.photoKey,
         userIdEditAvailable,
       },
       tokens: {
@@ -506,16 +471,14 @@ export class AuthService {
     const isEmail = rawIdentifier.includes('@');
     const lookupParam = isEmail ? rawIdentifier.toLowerCase() : rawIdentifier;
 
-    const query = isEmail
-      ? `SELECT id, user_id, email, name, status, locked_until FROM users WHERE email = $1`
-      : `SELECT id, user_id, email, name, status, locked_until FROM users WHERE user_id = $1`;
+    const user = await User.findOne(
+      isEmail ? { email: lookupParam } : { userId: lookupParam }
+    ).lean();
 
-    const userResult = await db.query(query, [lookupParam]);
-    if (userResult.rows.length === 0) {
+    if (!user) {
       throw AppError.notFound('No account found with this User ID or email.');
     }
 
-    const user = userResult.rows[0];
     if (user.status !== 'ACTIVE') {
       throw AppError.forbidden('This account is not active.');
     }
@@ -526,9 +489,9 @@ export class AuthService {
       purpose: 'login',
       template: 'otp-login',
       payload: {
-        name: user.name,
-        userUuid: user.id,
-        userId: user.user_id,
+        name: user.name || user.fullName,
+        userUuid: user._id.toString(),
+        userId: user.userId,
       },
       isResend: true,
     });

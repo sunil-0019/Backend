@@ -8,6 +8,9 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import { User, Session, UserIdHistory, LoginEvent, EmailOutbox } from '../src/models/index.js';
+import { levenshtein } from '../src/utils/levenshtein.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -17,15 +20,18 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
   beforeAll(async () => {
     process.env.NODE_ENV = 'test';
     await ensureRedisConnected(3000);
+    if (db.mongoose.connection.readyState !== 1) {
+      await db.connect();
+    }
 
     // Clean up ONLY automated test accounts (riya.*), preserving ALL developer and user accounts, sessions, and data
-    await db.query(`
-      DELETE FROM sessions WHERE user_uuid IN (SELECT id FROM users WHERE email LIKE 'riya.%');
-      DELETE FROM user_id_history WHERE user_uuid IN (SELECT id FROM users WHERE email LIKE 'riya.%');
-      DELETE FROM login_events WHERE email LIKE 'riya.%';
-      DELETE FROM email_outbox WHERE to_email LIKE 'riya.%';
-      DELETE FROM users WHERE email LIKE 'riya.%';
-    `);
+    const riyaUsers = await User.find({ email: /^riya\./i }).select('_id');
+    const riyaIds = riyaUsers.map(u => u._id);
+    await Session.deleteMany({ userUuid: { $in: riyaIds } });
+    await UserIdHistory.deleteMany({ userUuid: { $in: riyaIds } });
+    await LoginEvent.deleteMany({ email: /^riya\./i });
+    await EmailOutbox.deleteMany({ toEmail: /^riya\./i });
+    await User.deleteMany({ email: /^riya\./i });
 
     // Clean up only test keys in Redis (preserving real user sessions, locks, and OTPs)
     const testKeys = await redis.keys('*riya.*');
@@ -43,13 +49,9 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
 
   // Helper to extract OTP sent to outbox
   async function getLatestOtp(email, purpose) {
-    const res = await db.query(
-      `SELECT payload FROM email_outbox WHERE to_email = $1 ORDER BY created_at DESC LIMIT 1`,
-      [email.toLowerCase().trim()]
-    );
-    if (res.rows.length === 0) return null;
-    const payload = typeof res.rows[0].payload === 'string' ? JSON.parse(res.rows[0].payload) : res.rows[0].payload;
-    return payload.otp;
+    const doc = await EmailOutbox.findOne({ toEmail: email.toLowerCase().trim() }).sort({ createdAt: -1 });
+    if (!doc || !doc.payload) return null;
+    return doc.payload.otp;
   }
 
   // Helper to log in via OTP (Passwordless Login)
@@ -58,10 +60,9 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
       .post('/api/v1/auth/login/send-otp')
       .send({ identifier });
 
-    const userRow = (await db.query(
-      `SELECT email FROM users WHERE email = $1 OR user_id = $1`,
-      [identifier.toLowerCase().trim()]
-    )).rows[0];
+    const userRow = await User.findOne({
+      $or: [{ email: identifier.toLowerCase().trim() }, { userId: identifier.trim() }]
+    });
 
     const otp = await getLatestOtp(userRow.email, 'login');
 
@@ -236,12 +237,9 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(verifyRes.body.linkedDevices.items[0].isCurrent).toBe(true);
 
     // Welcome email queued in outbox WITHOUT password
-    const welcomeMail = await db.query(
-      `SELECT payload FROM email_outbox WHERE to_email = $1 AND template = 'welcome' ORDER BY created_at DESC LIMIT 1`,
-      [testEmail]
-    );
-    expect(welcomeMail.rows.length).toBeGreaterThan(0);
-    const welcomePayload = typeof welcomeMail.rows[0].payload === 'string' ? JSON.parse(welcomeMail.rows[0].payload) : welcomeMail.rows[0].payload;
+    const welcomeMail = await EmailOutbox.findOne({ toEmail: testEmail, template: 'welcome' }).sort({ createdAt: -1 });
+    expect(welcomeMail).not.toBeNull();
+    const welcomePayload = welcomeMail.payload;
     expect(welcomePayload.password).toBeUndefined();
     expect(welcomePayload.userId).toBe(verifyRes.body.user.userId);
   });
@@ -269,19 +267,18 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(id1.length).toBeGreaterThanOrEqual(8);
     expect(id2.length).toBeGreaterThanOrEqual(8);
 
-    // Check Levenshtein distance via PostgreSQL
-    const distQuery = await db.query(`SELECT levenshtein($1, $2) as dist`, [id1, id2]);
-    const distance = parseInt(distQuery.rows[0].dist, 10);
+    // Check Levenshtein distance
+    const distance = levenshtein(id1, id2);
     expect(distance).toBeGreaterThanOrEqual(3);
   });
 
-  // 7. Email update attempt (API and SQL) fails
+  // 7. Email update attempt (API and DB trigger) fails
   test('7. Email update attempt (API and SQL trigger) fails with EMAIL_NOT_EDITABLE / EMAIL_IMMUTABLE', async () => {
     const testEmail = 'riya.signup@gmail.com';
 
     // Fetch token for testEmail
-    const userRow = (await db.query(`SELECT id FROM users WHERE email = $1`, [testEmail])).rows[0];
-    const sessionRow = (await db.query(`SELECT id FROM sessions WHERE user_uuid = $1 LIMIT 1`, [userRow.id])).rows[0];
+    const userRow = await User.findOne({ email: testEmail });
+    const sessionRow = await Session.findOne({ userUuid: userRow.id });
     
     const { signAccessToken } = await import('../src/utils/crypto.js');
     const token = signAccessToken({
@@ -300,25 +297,23 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(apiRes.status).toBe(400);
     expect(apiRes.body.code).toBe('EMAIL_NOT_EDITABLE');
 
-    // 2. Direct SQL UPDATE attempt
-    let sqlError = null;
+    // 2. Direct DB UPDATE attempt
+    let dbError = null;
     try {
-      await db.query(`UPDATE users SET email = 'hacked@gmail.com' WHERE email = $1`, [testEmail]);
+      await User.updateOne({ email: testEmail }, { email: 'hacked@gmail.com' });
     } catch (err) {
-      sqlError = err;
+      dbError = err;
     }
-    expect(sqlError).not.toBeNull();
-    expect(sqlError.message).toContain('EMAIL_IMMUTABLE');
+    expect(dbError).not.toBeNull();
+    expect(dbError.message).toContain('EMAIL_IMMUTABLE');
   });
 
   // 8. 100% Passwordless Architecture Verification
   test('8. Passwordless Architecture: Users table has no password_hash, welcome email has no password', async () => {
-    const cols = await db.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_name = 'users'`
-    );
-    const colNames = cols.rows.map(r => r.column_name);
-    expect(colNames).not.toContain('password_hash');
-    expect(colNames).not.toContain('password_changed_at');
+    const schemaPaths = Object.keys(User.schema.paths);
+    expect(schemaPaths).not.toContain('password_hash');
+    expect(schemaPaths).not.toContain('password_changed_at');
+    expect(schemaPaths).not.toContain('password');
   });
 
   // 9. Every login -> login_events + login alert email + linkedDevices (count + items)
@@ -354,20 +349,14 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(reLoginRes.body.linkedDevices.items).toHaveLength(2);
 
     // Verify login_events row
-    const events = await db.query(
-      `SELECT * FROM login_events WHERE email = $1 AND kind = 'LOGIN_OTP' ORDER BY created_at DESC`,
-      [testEmail]
-    );
-    expect(events.rows.length).toBeGreaterThan(0);
-    expect(events.rows[0].success).toBe(true);
-    expect(events.rows[0].device_name).toBe('Chrome Laptop');
+    const events = await LoginEvent.find({ email: testEmail, kind: 'LOGIN_OTP' }).sort({ createdAt: -1 });
+    expect(events.length).toBeGreaterThan(0);
+    expect(events[0].success).toBe(true);
+    expect(events[0].deviceName).toBe('Chrome Laptop');
 
     // Verify login-alert email
-    const alertMail = await db.query(
-      `SELECT * FROM email_outbox WHERE to_email = $1 AND template = 'login-alert'`,
-      [testEmail]
-    );
-    expect(alertMail.rows.length).toBeGreaterThan(0);
+    const alertMail = await EmailOutbox.find({ toEmail: testEmail, template: 'login-alert' });
+    expect(alertMail.length).toBeGreaterThan(0);
   });
 
   // 10. User ID Edit: Max 2 edits in 1 month (30 days), no password required
@@ -415,11 +404,8 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     expect(edit3Res.body.message).toContain('You can only change your User ID 2 times every 1 month');
 
     // Verify NO email is sent for User ID update as per user requirement
-    const idMail = await db.query(
-      `SELECT * FROM email_outbox WHERE to_email = $1 AND template = 'userid-updated'`,
-      [testEmail]
-    );
-    expect(idMail.rows.length).toBe(0);
+    const idMail = await EmailOutbox.find({ toEmail: testEmail, template: 'userid-updated' });
+    expect(idMail.length).toBe(0);
   });
 
   // 11. Sliding Window Token Rotation: Old refresh token is invalidated upon rotation

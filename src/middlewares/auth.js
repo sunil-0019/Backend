@@ -1,6 +1,6 @@
 import { verifyAccessToken } from '../utils/crypto.js';
 import { redis } from '../config/redis.js';
-import { db } from '../config/db.js';
+import { User, Session } from '../models/index.js';
 import { AppError } from '../core/errors.js';
 
 export async function requireAuth(req, res, next) {
@@ -24,53 +24,47 @@ export async function requireAuth(req, res, next) {
       return next(AppError.sessionRevoked(revokedReason, message));
     }
 
-    // Check database user and session
-    const result = await db.query(
-      `SELECT u.id, u.user_id, u.email, u.name, u.about, u.photo_key, u.status, u.token_version,
-              u.user_id_changed_at, u.user_id_change_count,
-              s.id AS session_id, s.device_name, s.platform
-       FROM users u
-       JOIN sessions s ON s.user_uuid = u.id
-       WHERE u.id = $1 AND s.id = $2`,
-      [payload.sub, payload.sessionId]
-    );
-
-    if (result.rows.length === 0) {
+    // Check database session and user
+    const session = await Session.findOne({ _id: payload.sessionId, userUuid: payload.sub }).lean();
+    if (!session) {
       return next(AppError.sessionRevoked('SESSION_REVOKED', 'Session no longer exists.'));
     }
 
-    const row = result.rows[0];
+    const user = await User.findById(payload.sub).lean();
+    if (!user) {
+      return next(AppError.sessionRevoked('SESSION_REVOKED', 'Session no longer exists.'));
+    }
 
     // Check user status
-    if (row.status !== 'ACTIVE') {
-      return next(AppError.forbidden(`Account status is ${row.status}`, 'ACCOUNT_INACTIVE'));
+    if (user.status !== 'ACTIVE') {
+      return next(AppError.forbidden(`Account status is ${user.status}`, 'ACCOUNT_INACTIVE'));
     }
 
     // Check token version
-    if (typeof payload.tokenVersion === 'number' && row.token_version !== payload.tokenVersion) {
+    if (typeof payload.tokenVersion === 'number' && user.tokenVersion !== payload.tokenVersion) {
       return next(AppError.sessionRevoked('SESSION_REVOKED', 'Your session has expired. Please sign in again.'));
     }
 
-    // Throttled update of last_active_at (e.g. fire-and-forget)
-    db.query('UPDATE sessions SET last_active_at = now() WHERE id = $1', [row.session_id]).catch(() => {});
+    // Throttled update of lastActiveAt (fire-and-forget)
+    Session.updateOne({ _id: session._id }, { lastActiveAt: new Date() }).catch(() => {});
 
     req.user = {
-      id: row.id,
-      userId: row.user_id,
-      email: row.email,
-      name: row.name,
-      about: row.about,
-      photoUrl: row.photo_key,
-      status: row.status,
-      tokenVersion: row.token_version,
-      userIdChangedAt: row.user_id_changed_at,
-      userIdChangeCount: row.user_id_change_count,
+      id: user._id.toString(),
+      userId: user.userId,
+      email: user.email,
+      name: user.name || user.fullName || '',
+      about: user.about,
+      photoUrl: user.photoKey || null,
+      status: user.status,
+      tokenVersion: user.tokenVersion,
+      userIdChangedAt: user.userIdChangedAt,
+      userIdChangeCount: user.userIdChangeCount,
     };
 
     req.session = {
-      id: row.session_id,
-      deviceName: row.device_name,
-      platform: row.platform,
+      id: session._id.toString(),
+      deviceName: session.deviceName,
+      platform: session.platform,
     };
 
     req.tokenPayload = payload;

@@ -5,11 +5,14 @@ import { redis } from './config/redis.js';
 import { runMigrations } from './db/migrate.js';
 
 async function bootstrap() {
-  // Automatically ensure tables exist on startup (especially on new cloud hosts like Render)
+  // Connect to MongoDB
+  await db.connect();
+
+  // Automatically ensure database collections and indexes exist
   try {
     await runMigrations();
   } catch (err) {
-    console.warn('⚠️  [ChatLeaf] Database migration check warning:', err.message);
+    console.warn('⚠️  [ChatLeaf] Database index check warning:', err.message);
   }
 
   const app = await createApp();
@@ -23,7 +26,7 @@ async function bootstrap() {
       try {
         await db.close();
         await redis.quit();
-        console.log('PostgreSQL and Redis connections closed.');
+        console.log('MongoDB and Redis connections closed.');
         process.exit(0);
       } catch (err) {
         console.error('Error during shutdown:', err);

@@ -1,46 +1,70 @@
 import { db } from '../config/db.js';
 import { redis } from '../config/redis.js';
+import { User, Session, UserIdHistory, LoginEvent, EmailOutbox } from '../models/index.js';
 
 async function inspect() {
   console.log('\n======================================================');
-  console.log('🍃 CHATLEAF DATABASE & CACHE INSPECTION REPORT');
+  console.log('🍃 CHATLEAF DATABASE (MONGODB ATLAS) & CACHE REPORT');
   console.log('======================================================\n');
 
-  // 1. PostgreSQL Schema Tables
-  const allTablesRes = await db.query(
-    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name"
-  );
-  console.log('📋 All Existing Tables in PostgreSQL (' + allTablesRes.rows.length + ' tables):', allTablesRes.rows.map(r => r.table_name));
-  console.log('\n📊 Permanent Tables Summary:');
+  if (db.mongoose.connection.readyState !== 1) {
+    await db.connect();
+  }
 
-  const tables = ['users', 'sessions', 'user_id_history', 'login_events', 'email_outbox'];
+  // 1. Collections in MongoDB
+  const cols = await db.mongoose.connection.db.listCollections().toArray();
+  console.log('📋 All Existing Collections in MongoDB (' + cols.length + ' collections):', cols.map(c => c.name));
+  console.log('\n📊 Permanent Collections Summary:');
+
+  const modelsList = [
+    { name: 'users', model: User },
+    { name: 'sessions', model: Session },
+    { name: 'user_id_history', model: UserIdHistory },
+    { name: 'login_events', model: LoginEvent },
+    { name: 'email_outbox', model: EmailOutbox },
+  ];
+
   const summary = [];
-
-  for (const t of tables) {
-    const res = await db.query(`SELECT count(*) FROM ${t}`);
-    summary.push({ 'PostgreSQL Table (Permanent)': t, 'Total Rows': Number(res.rows[0].count) });
+  for (const item of modelsList) {
+    const count = await item.model.countDocuments();
+    summary.push({ 'MongoDB Collection (Permanent)': item.name, 'Total Documents': count });
   }
   console.table(summary);
 
   // 2. Sample Users
-  const usersRes = await db.query(`SELECT id, user_id, name, email, status, created_at FROM users ORDER BY created_at DESC LIMIT 5`);
-  console.log('\n👤 [2] Registered Users (Permanent in PostgreSQL):');
-  if (usersRes.rows.length === 0) {
+  const users = await User.find().sort({ createdAt: -1 }).limit(5).lean();
+  console.log('\n👤 [2] Registered Users (Permanent in MongoDB):');
+  if (users.length === 0) {
     console.log('   (No users found)');
   } else {
-    console.table(usersRes.rows);
+    console.table(users.map(u => ({
+      id: u._id,
+      userId: u.userId,
+      name: u.name || u.fullName,
+      email: u.email,
+      status: u.status,
+      createdAt: u.createdAt,
+    })));
   }
 
-  // 3. Sample Sessions / Devices
-  const sessionsRes = await db.query(`SELECT id, user_uuid, device_name, platform, ip, created_at, last_active_at FROM sessions ORDER BY created_at DESC LIMIT 5`);
-  console.log('\n📱 [3] Active Linked Device Sessions (Permanent in PostgreSQL):');
-  if (sessionsRes.rows.length === 0) {
+  // 3. Sample Sessions
+  const sessions = await Session.find().sort({ createdAt: -1 }).limit(5).lean();
+  console.log('\n📱 [3] Active Linked Device Sessions (Permanent in MongoDB):');
+  if (sessions.length === 0) {
     console.log('   (No active sessions found)');
   } else {
-    console.table(sessionsRes.rows);
+    console.table(sessions.map(s => ({
+      id: s._id,
+      userUuid: s.userUuid,
+      deviceName: s.deviceName,
+      platform: s.platform,
+      ip: s.ip,
+      createdAt: s.createdAt,
+      lastActiveAt: s.lastActiveAt,
+    })));
   }
 
-  // 4. Redis Keys (Temporary with TTL)
+  // 4. Redis Keys
   await new Promise(r => setTimeout(r, 600));
   const redisKeys = await redis.keys('*');
   console.log(`\n⚡ [4] Redis Cache (Upstash Cloud - Temporary with Auto-TTL) - Total Keys: ${redisKeys.length}:`);

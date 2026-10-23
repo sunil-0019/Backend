@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { db } from '../../config/db.js';
 import { env } from '../../config/env.js';
+import { EmailOutbox } from '../../models/index.js';
 import { AppError } from '../../core/errors.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -68,14 +69,13 @@ export class MailService {
     const textContent = typeof template.text === 'function' ? template.text(context) : template.text || '';
 
     // Record into outbox
-    const queryTarget = options.client || db;
-    const outboxResult = await queryTarget.query(
-      `INSERT INTO email_outbox (to_email, template, payload, status)
-       VALUES ($1, $2, $3, 'QUEUED')
-       RETURNING id`,
-      [toEmail, templateName, JSON.stringify(context)]
-    );
-    const outboxId = outboxResult.rows[0].id;
+    const outboxDoc = await EmailOutbox.create({
+      toEmail,
+      template: templateName,
+      payload: context,
+      status: 'QUEUED',
+    });
+    const outboxId = outboxDoc.id;
 
     // In test environment or if mock key, deliver immediately to memory
     if (env.NODE_ENV === 'test' || env.BREVO_API_KEY.includes('mock') || env.BREVO_API_KEY.includes('test')) {
@@ -90,9 +90,9 @@ export class MailService {
         sentAt: new Date(),
       });
 
-      await queryTarget.query(
-        `UPDATE email_outbox SET status = 'SENT', provider_message_id = $1, sent_at = now() WHERE id = $2`,
-        [`mock-msg-${Date.now()}`, outboxId]
+      await EmailOutbox.updateOne(
+        { _id: outboxId },
+        { status: 'SENT', providerMessageId: `mock-msg-${Date.now()}`, sentAt: new Date() }
       );
       return { id: outboxId, success: true, providerMessageId: `mock-msg-${Date.now()}` };
     }
@@ -126,9 +126,9 @@ export class MailService {
           if (parsed.message) errorMsg = parsed.message;
         } catch (_) {}
 
-        await db.query(
-          `UPDATE email_outbox SET status = 'FAILED', error = $1 WHERE id = $2`,
-          [errorMsg, outboxId]
+        await EmailOutbox.updateOne(
+          { _id: outboxId },
+          { status: 'FAILED', error: errorMsg }
         );
 
         let userFacingError = `Brevo Email Error: ${errorMsg}`;
@@ -146,9 +146,9 @@ export class MailService {
 
       const result = await response.json();
       const messageId = result.messageId || `brevo-${Date.now()}`;
-      await db.query(
-        `UPDATE email_outbox SET status = 'SENT', provider_message_id = $1, sent_at = now() WHERE id = $2`,
-        [messageId, outboxId]
+      await EmailOutbox.updateOne(
+        { _id: outboxId },
+        { status: 'SENT', providerMessageId: messageId, sentAt: new Date() }
       );
       return { id: outboxId, success: true, providerMessageId: messageId };
     } catch (err) {
