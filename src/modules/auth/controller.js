@@ -82,4 +82,18 @@ export const authController = {
       next(err);
     }
   },
+
+  async googleAuth(req, res, next) {
+    try {
+      const ip = req.body.ipAddress || req.body.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.socket?.remoteAddress || '127.0.0.1';
+      const result = await authService.googleAuth({
+        ...req.body,
+        ip,
+      });
+      const statusCode = result.isNewUser ? 201 : 200;
+      res.status(statusCode).json(result);
+    } catch (err) {
+      next(err);
+    }
+  },
 };

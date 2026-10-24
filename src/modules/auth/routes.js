@@ -10,6 +10,7 @@ import {
   refreshSchema,
   sendLoginOtpSchema,
   verifyLoginOtpSchema,
+  googleAuthSchema,
 } from './schema.js';
 
 const router = Router();
@@ -21,6 +22,7 @@ router.post('/signup/verify', verifyOtpLimiter, validate(verifySignupSchema), au
 router.post('/login/send-otp', sendOtpLimiter, validate(sendLoginOtpSchema), authController.sendLoginOtp);
 router.post('/login/resend-otp', sendOtpLimiter, validate(sendLoginOtpSchema), authController.resendLoginOtp);
 router.post('/login/verify-otp', verifyOtpLimiter, validate(verifyLoginOtpSchema), authController.verifyLoginOtp);
+router.post('/google', validate(googleAuthSchema), authController.googleAuth);
 router.post('/refresh', validate(refreshSchema), authController.refresh);
 router.post('/logout', requireAuth, authController.logout);
 

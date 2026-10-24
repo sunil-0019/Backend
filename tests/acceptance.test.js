@@ -880,4 +880,67 @@ describe('ChatLeaf - Auth & Onboarding Specification Acceptance Tests', () => {
     const listAfter = await request(app).get('/api/v1/me/sessions').set('Authorization', `Bearer ${mainToken}`);
     expect(listAfter.body.count).toBe(1);
   });
+
+  // 22. Unified Google Sign-in / Sign-up: New user gets created automatically
+  test('22. Google Auth: New user automatically signs up, receives tokens, welcome email, and linked device', async () => {
+    const googleEmail = 'riya.googlenew@gmail.com';
+    const res = await request(app)
+      .post('/api/v1/auth/google')
+      .send({
+        idToken: 'mock-google-token-new',
+        email: googleEmail,
+        name: 'Riya Google',
+        photoUrl: 'https://example.com/riya.jpg',
+        device: { deviceName: 'Pixel 8', platform: 'android' },
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.code).toBe('GOOGLE_SIGNUP_SUCCESS');
+    expect(res.body.isNewUser).toBe(true);
+    expect(res.body.user.email).toBe(googleEmail);
+    expect(res.body.user.userId).toBeDefined();
+    expect(res.body.tokens.accessToken).toBeDefined();
+    expect(res.body.tokens.refreshToken).toBeDefined();
+    expect(res.body.linkedDevices.count).toBe(1);
+    expect(res.body.linkedDevices.items[0].deviceName).toBe('Pixel 8');
+
+    // Welcome email queued in outbox
+    const welcomeMail = await EmailOutbox.findOne({ toEmail: googleEmail, template: 'welcome' });
+    expect(welcomeMail).not.toBeNull();
+  });
+
+  // 23. Unified Google Sign-in / Sign-up: Existing user logs in, preserves devices & updates same device
+  test('23. Google Auth: Existing user logs in smoothly, returns profile, preserves sessions', async () => {
+    const googleEmail = 'riya.googlenew@gmail.com';
+
+    // 2nd Login from another device
+    const res2 = await request(app)
+      .post('/api/v1/auth/google')
+      .send({
+        idToken: 'mock-google-token-existing',
+        email: googleEmail,
+        name: 'Riya Google',
+        device: { deviceName: 'MacBook Pro', platform: 'web' },
+      });
+
+    expect(res2.status).toBe(200);
+    expect(res2.body.code).toBe('GOOGLE_LOGIN_SUCCESS');
+    expect(res2.body.isNewUser).toBe(false);
+    expect(res2.body.user.email).toBe(googleEmail);
+    expect(res2.body.linkedDevices.count).toBe(2);
+    expect(res2.body.tokens.accessToken).toBeDefined();
+
+    // Re-login from same MacBook Pro -> replaces session, no duplicates
+    const resSame = await request(app)
+      .post('/api/v1/auth/google')
+      .send({
+        idToken: 'mock-google-token-existing',
+        email: googleEmail,
+        name: 'Riya Google',
+        device: { deviceName: 'MacBook Pro', platform: 'web' },
+      });
+
+    expect(resSame.status).toBe(200);
+    expect(resSame.body.linkedDevices.count).toBe(2); // Still 2
+  });
 });

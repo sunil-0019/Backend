@@ -9,6 +9,8 @@ const userSchema = new mongoose.Schema({
   fullName: { type: String, default: '' },
   about: { type: String, default: 'Hey there! I am using ChatLeaf.' },
   photoKey: { type: String, default: null },
+  googleId: { type: String, default: null, index: true, sparse: true },
+  authProvider: { type: String, default: 'local' }, // 'local' | 'google'
   status: { type: String, default: 'ACTIVE' },
   tokenVersion: { type: Number, default: 0 },
   userIdChangeCount: { type: Number, default: 0 },

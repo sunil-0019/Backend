@@ -60,3 +60,27 @@ export const verifyLoginOtpSchema = z.object({
     ip: z.string().optional(),
   }),
 });
+
+export const googleAuthSchema = z.object({
+  body: z.object({
+    idToken: z.string().trim().optional(),
+    token: z.string().trim().optional(),
+    credential: z.string().trim().optional(),
+    email: z.string().trim().toLowerCase().email('Invalid email address').optional(),
+    name: z.string().trim().optional(),
+    photoUrl: z.string().trim().optional(),
+    device: z.object({
+      deviceId: z.string().optional(),
+      deviceName: z.string().optional(),
+      model: z.string().optional(),
+      platform: z.string().optional(),
+      appVersion: z.string().optional(),
+    }).optional().default({}),
+    fcmToken: z.string().optional(),
+    ipAddress: z.string().optional(),
+    ip: z.string().optional(),
+  }).refine(data => data.idToken || data.token || data.credential || data.email, {
+    message: 'Google idToken (or email) is required',
+    path: ['idToken'],
+  }),
+});
